@@ -248,14 +248,18 @@ bool                gbk = false;
 bool                chinasea = false;
 bool                uao = false;
 bool                jp_ega = false;
+#if !defined(OSFREE)
 bool                j3100_start = false;
+#endif
 bool                want_fm_towns = false;
 
 bool                dos_con_use_int16_to_detect_input = true;
 
-bool                dbg_zero_on_dos_allocmem = true;
-bool                dbg_zero_on_xms_allocmem = true;
-bool                dbg_zero_on_ems_allocmem = true;
+#if !defined(OSFREE)
+bool                dbg_zero_on_dos_allocmem = false;
+bool                dbg_zero_on_xms_allocmem = false;
+bool                dbg_zero_on_ems_allocmem = false;
+#endif
 
 /* the exact frequency of the NTSC color subcarrier ~3.579545454...MHz or 315/88 */
 /* see: https://en.wikipedia.org/wiki/Colorburst */
@@ -956,13 +960,13 @@ void Init_VGABIOS() {
         }
         if (rom_fp == NULL) {
             path = "";
-            Cross::GetPlatformResDir(path);
+            path = Cross::GetPlatformResDir();
             path += VGA_BIOS_rom;
             rom_fp = fopen(path.c_str(),"rb");
         }
         if (rom_fp == NULL) {
             path = "";
-            Cross::GetPlatformConfigDir(path);
+            path = Cross::GetPlatformConfigDir();
             path += VGA_BIOS_rom;
             rom_fp = fopen(path.c_str(),"rb");
         }
@@ -1101,16 +1105,39 @@ void SetIME() {
 #endif
 }
 
+unsigned int BeepDuration() {
+	Section_prop *section = static_cast<Section_prop *>(control->GetSection("dosbox"));
+	unsigned int d = section->Get_int("beep duration");
+
+	if (d == 0) {//default
+		if (IS_EGAVGA_ARCH || machine == MCH_TANDY || machine == MCH_AMSTRAD || machine == MCH_MCGA) {
+			d = 333; /* DOSBox SVN default */
+		}
+		else if (IS_PC98_ARCH) {
+			d = 300; /* FIXME: Guess */
+		}
+		else { // MDA, CGA, Hercules, PCjr, anything IBM
+			d = 500; /* IBM standard in the 1980s, see BIOS listings to see what I mean */
+		}
+	}
+
+	return d;
+}
+
 void DOSBOX_RealInit() {
     DOSBoxMenu::item *item;
 
     LOG(LOG_MISC,LOG_DEBUG)("DOSBOX-X RealInit: loading settings and initializing");
 
-    MAPPER_AddHandler(DOSBOX_UnlockSpeed2, MK_rightarrow, MMODHOST,"speedlock","Toggle Speedlock");
     {
-        MAPPER_AddHandler(DOSBOX_UnlockSpeed2, MK_nothing, 0, "speedlock2", "Turbo (Fast Forward)", &item);
-        item->set_description("Toggle emulation speed, to allow running faster than realtime (fast forward)");
-        item->set_text("Turbo (Fast Forward)");
+        MAPPER_AddHandler(DOSBOX_UnlockSpeed, MK_grave, MMODHOST, "speedlock", "Turbo (fast-forward): burst", &item);
+        item->set_description("Burst turbo (fast-forward) emulation speed, to allow running faster than realtime");
+        item->set_text("Turbo (fast-forward): burst mode");
+    }
+    {
+        MAPPER_AddHandler(DOSBOX_UnlockSpeed2, MK_rightarrow, MMODHOST, "speedlock2", "Turbo (fast-forward): toggle", &item);
+        item->set_description("Toggle turbo (fast-forward) emulation speed, to allow running faster than realtime");
+        item->set_text("Turbo (fast-forward)");
     }
     {
         MAPPER_AddHandler(DOSBOX_NormalSpeed, MK_leftarrow, MMODHOST, "speednorm","Normal speed", &item);
@@ -1194,6 +1221,7 @@ void DOSBOX_RealInit() {
     s3Card = S3_Generic;
     machine = MCH_VGA;
     jp_ega = false;
+    int10.vesa_vbe3 = false;
     int10.vesa_nolfb = false;
     int10.vesa_oldvbe = false;
     int10.vesa_oldvbe10 = false;
@@ -1237,6 +1265,7 @@ void DOSBOX_RealInit() {
     else if (mtype == "vesa_nolfb")    { svgaCard = SVGA_S3Trio; s3Card = S3_Trio32; int10.vesa_nolfb = true;}
     else if (mtype == "vesa_oldvbe")   { svgaCard = SVGA_S3Trio; s3Card = S3_Trio32; int10.vesa_oldvbe = true;}
     else if (mtype == "vesa_oldvbe10") { svgaCard = SVGA_S3Trio; s3Card = S3_Trio32; int10.vesa_oldvbe = true; int10.vesa_oldvbe10 = true;}
+    else if (mtype == "vesa_vbe3")     { svgaCard = SVGA_S3Trio; s3Card = S3_Trio32; int10.vesa_vbe3 = true;}
     else if (mtype == "svga_et4000")   { svgaCard = SVGA_TsengET4K; }
     else if (mtype == "svga_et3000")   { svgaCard = SVGA_TsengET3K; }
     else if (mtype == "svga_paradise") { svgaCard = SVGA_ParadisePVGA1A; }
@@ -1247,10 +1276,15 @@ void DOSBOX_RealInit() {
     else if (mtype == "pc9821")        { machine = MCH_PC98; } /* Future differentiation */
 
     else if (mtype == "fm_towns")      { machine = MCH_VGA; want_fm_towns = true; /*machine = MCH_FM_TOWNS;*/ }
+    else if (mtype == "svga_dosbox")   { machine = MCH_VGA; svgaCard = SVGA_DOSBoxIG; int10.vesa_vbe3 = true; } /* special emulator accelerator graphics adapter */
+    else if (mtype == "svga_dosbox_vbe2") { machine = MCH_VGA; svgaCard = SVGA_DOSBoxIG; } /* special emulator accelerator graphics adapter */
 
     else E_Exit("DOSBOX-X:Unknown machine type %s",mtype.c_str());
 
+#if !defined(OSFREE)
     dos.set_jdosv_enabled = dos.set_kdosv_enabled = dos.set_pdosv_enabled = dos.set_tdosv_enabled = dos.set_j3100_enabled = j3100_start = false;
+#endif
+#if !defined(OSFREE)
     Section_prop *dosv_section = static_cast<Section_prop *>(control->GetSection("dosv"));
     const char *dosvstr = dosv_section->Get_string("dosv");
     del_flag = dosv_section->Get_bool("del");
@@ -1267,10 +1301,14 @@ void DOSBOX_RealInit() {
     if (!strcasecmp(dosvstr, "ko")) dos.set_kdosv_enabled = true;
     if (!strcasecmp(dosvstr, "chs")||!strcasecmp(dosvstr, "cn")) dos.set_pdosv_enabled = true;
     if (!strcasecmp(dosvstr, "cht")||!strcasecmp(dosvstr, "tw")) dos.set_tdosv_enabled = true;
+#endif
+#if !defined(OSFREE)
     if (machine != MCH_VGA || want_fm_towns) {
         LOG_MSG("WARNING: DOS/V is only supported for VGA video cards.");
         dos.set_jdosv_enabled = dos.set_kdosv_enabled = dos.set_pdosv_enabled = dos.set_tdosv_enabled = false;
     }
+#endif
+#if !defined(OSFREE)
     int cp = dos.loaded_codepage;
     if (!cp) InitCodePage();
 #if defined(USE_TTF)
@@ -1284,6 +1322,7 @@ void DOSBOX_RealInit() {
         if (IS_DOSV) DOSV_SetConfig(dosv_section);
 #endif
     }
+#endif
     Section_prop *ttf_section = static_cast<Section_prop *>(control->GetSection("ttf"));
     gbk = ttf_section->Get_bool("gbk");
     chinasea = ttf_section->Get_bool("chinasea");
@@ -1292,7 +1331,9 @@ void DOSBOX_RealInit() {
         makestdcp950table();
         makeseacp951table();
     }
+#if !defined(OSFREE)
     dos.loaded_codepage = cp;
+#endif
     if (!tonoime) SetIME();
 #if defined(USE_TTF)
     if (IS_PC98_ARCH) ttf.cols = 80; // The number of columns on the screen is apparently fixed to 80 in PC-98 mode at this time
@@ -1457,7 +1498,7 @@ void DOSBOX_SetupConfigSections(void) {
     const char* aspectmodes[] = { "false", "true", "0", "1", "yes", "no", "nearest", "bilinear", nullptr };
     const char *vga_ac_mapping_settings[] = { "", "auto", "4x4", "4low", "first16", nullptr };
     const char* fpu_settings[] = { "true", "false", "1", "0", "auto", "8087", "287", "387", nullptr };
-    const char* sb_recording_sources[] = { "silence", "hiss", "1khz tone", nullptr };
+    const char* sb_recording_sources[] = { "silence", "hiss", "1khz tone", "microphone", nullptr };
     const char* int10usevp[] = { "auto", "true", "false", "1", "0", nullptr };
 
     const char* hostkeys[] = {
@@ -1471,6 +1512,9 @@ void DOSBOX_SetupConfigSections(void) {
 
     const char* pseopts[] = {
         "auto", "none", "pse", "pse36", "pse40", "true", "false", nullptr };
+
+    const char* exepackopts[] = {
+        "none", "a20off", "unpack", nullptr };
 
     /* Setup all the different modules making up DOSBox-X */
     const char* machines[] = {
@@ -1494,7 +1538,7 @@ void DOSBOX_SetupConfigSections(void) {
         "svga_s3virge", "svga_s3virgevx",
         "svga_et3000", "svga_et4000",
         "svga_paradise",
-        "vesa_nolfb", "vesa_oldvbe", "vesa_oldvbe10",
+        "vesa_nolfb", "vesa_oldvbe", "vesa_oldvbe10", "vesa_vbe3",
         "pc98", "pc9801", "pc9821",
 	"svga_ati_egavgawonder",
 	"svga_ati_vgawonder",
@@ -1504,6 +1548,8 @@ void DOSBOX_SetupConfigSections(void) {
 	"svga_ati_mach8",
 	"svga_ati_mach32",
 	"svga_ati_mach64",
+	"svga_dosbox",
+	"svga_dosbox_vbe2",
 	"fm_towns", // STUB
         nullptr };
 
@@ -1528,7 +1574,12 @@ void DOSBOX_SetupConfigSections(void) {
 #if C_OPENGL
         "opengl", "openglnb", "openglhq", "openglpp",
 #endif
-        "direct3d",
+#if C_DIRECT3D
+        "direct3d", "direct3d11",
+#endif
+#if defined(MACOSX) && defined(C_SDL2) && C_METAL
+        "metal",
+#endif
         nullptr };
 
     const char* scalers[] = {
@@ -1577,6 +1628,11 @@ void DOSBOX_SetupConfigSections(void) {
     Pstring->Set_help("Select a language file for DOSBox-X to use. Encoded with either UTF-8 or a DOS code page.\n"
                       "You can set code page either in the language file or with \"country\" setting in [config] section.");
     Pstring->SetBasic(true);
+
+    Pint = secprop->Add_int("beep duration", Property::Changeable::WhenIdle,0);
+    Pint->SetMinMax(0,5000);
+    Pint->Set_help("If nonzero, set the duration of a beep when DOS or INT 10h is given a BEL character");
+    Pint->SetBasic(true);
 
     Pstring = secprop->Add_string("title",Property::Changeable::Always,"");
     Pstring->Set_help("Additional text to place in the title bar of the window.");
@@ -2436,6 +2492,14 @@ void DOSBOX_SetupConfigSections(void) {
                     "at driver startup AND when INT 33h AX=0 is called. This is NEC MOUSE.COM behavior and default\n"
                     "enabled. To emulate other drivers like QMOUSE that do not follow this behavior, set to false.");
 
+    Pbool = secprop->Add_bool("pc-98 chargen vsync-limited access",Property::Changeable::WhenIdle,false);
+    Pbool->Set_help("If set, reading pixels from the character generator while in Code Access mode (or always, for ANK\n"
+                    "characters) will be invalid. Some models (i.e. PC-9821As3) dont seem to have this limitation, but\n"
+                    "many others do.\n"
+                    "This option is set to false by default, set this option to true if you suffer text glitches.\n"
+                    "It is reported that setting this option to true will result in glitches in some titles;"
+                    "therefore revert this option to false in such cases.");
+
     secprop=control->AddSection_prop("dosv",&Null_Init,true);
 
     Pstring = secprop->Add_string("dosv",Property::Changeable::OnlyAtStart,"off");
@@ -2579,8 +2643,24 @@ void DOSBOX_SetupConfigSections(void) {
 	    "\n"
 	    "This option may be useful if you would like to prevent your DOS gaming from appearing in the Windows 11 Recall feature");
 
+    Pint = secprop->Add_int("vbememsize", Property::Changeable::WhenIdle,0);
+    Pint->SetMinMax(0,128);
+    Pint->Set_help(
+        "Amount of video memory in kilobytes to report through the VESA BIOS extensions.\n"
+        "Set this value to an amount lower than vmemsize to handle DOS programs that cannot handle\n"
+        "more than the small amount of video memory they were designed for. This option also affects\n"
+        "what video modes are reported through the VBE."
+        );
+    Pint->SetBasic(true);
+
+    Pint = secprop->Add_int("vbememsizekb", Property::Changeable::WhenIdle,0);
+    Pint->SetMinMax(0,1024);
+    Pint->Set_help(
+        "Amount of video memory to report in kilobytes, in addition to vbememsize.");
+    Pint->SetBasic(true);
+
     Pint = secprop->Add_int("vmemsize", Property::Changeable::WhenIdle,-1);
-    Pint->SetMinMax(-1,16);
+    Pint->SetMinMax(-1,128);
     Pint->Set_help(
         "Amount of video memory in megabytes.\n"
         "  The maximum resolution and color depth the svga_s3 will be able to display\n"
@@ -2591,6 +2671,7 @@ void DOSBOX_SetupConfigSections(void) {
         "  2: 1600x1200 at 256 colors or 1024x768 at 64k colors or 640x480 at 16M colors\n"
         "  4: 1600x1200 at 64k colors or 1024x768 at 16M colors\n"
         "  8: up to 1600x1200 at 16M colors\n"
+	"Larger values are available depending on machine type.\n"
         "For build engine games, use more memory than in the list above so it can\n"
         "use triple buffering and thus won't flicker.\n"
         );
@@ -2609,6 +2690,9 @@ void DOSBOX_SetupConfigSections(void) {
     Pint = secprop->Add_int("vbe window size", Property::Changeable::WhenIdle,0);
     Pint->SetMinMax(0,128);
     Pint->Set_help("Controls VESA BIOS non-linear framebuffer window size in KB. This affects ONLY the VESA BIOS extensions. Set 0 to functional normally.");
+
+    Pbool = secprop->Add_bool("vbe protected mode interface",Property::Changeable::OnlyAtStart,true);
+    Pbool->Set_help("If set, enable the VBE protected mode interface");
 
     Pbool = secprop->Add_bool("enable 8-bit dac",Property::Changeable::OnlyAtStart,true);
     Pbool->Set_help("If set, allow VESA BIOS calls in IBM PC mode to set DAC width. Has no effect in PC-98 mode.");
@@ -2929,12 +3013,26 @@ void DOSBOX_SetupConfigSections(void) {
 		    "If graphical artifacts or errors occur, try turning this off first. May provide a performance benefit.");
     Pbool->SetBasic(true);
 
+    Pstring = secprop->Add_string("skip render if nothing changed",Property::Changeable::Always,"auto");
+    Pstring->Set_values(truefalseautoopt);
+    Pstring->Set_help("If set, DOSBox-X will skip rendering entirely unless any change is made to the guest display.\n"
+                      "This may provide a performance benefit, especially in SVGA modes. This option has no effect unless render on demand is true or auto.\n"
+                      "Normally in DOSBox and DOSBox-X, video is rendered constantly, whether or not anything changed,\n"
+                      "and then compared with the previous frame to determine where to update the host display.\n"
+                      "In addition to the render on demand option, this option may further break timing dependent effects and/or cause problems with some games.");
+    Pstring->SetBasic(true);
+
     Pstring = secprop->Add_string("scanline render on demand",Property::Changeable::Always,"auto");
     Pstring->Set_values(truefalseautoopt);
     Pstring->Set_help("Render video output at vsync or when something is changed mid frame, instead of stopping to render every scanline.\n"
-		    "May provide a performance benefit to most DOS games. However this may also break timing-dependent game or Demoscene effects.\n"
-		    "Default auto, which will turn if off for VGA modes and turn it on for SVGA modes.");
+                      "This may provide a performance benefit to most DOS games. However this may also break timing-dependent game or Demoscene effects.\n"
+                      "Default is auto, which will turn it off for VGA modes and turn it on for SVGA modes.");
     Pstring->SetBasic(true);
+
+    secprop=control->AddSection_prop("script",&Null_Init,true);//done
+
+    Pstring = secprop->Add_string("startup.js",Property::Changeable::WhenIdle,"");
+    Pstring->Set_help("script to run at startup");
 
     secprop=control->AddSection_prop("vsync",&Null_Init,true);//done
 
@@ -3687,8 +3785,17 @@ void DOSBOX_SetupConfigSections(void) {
 
 			Pstring = secprop->Add_string("recording source",Property::Changeable::WhenIdle,"silence");
 			Pstring->Set_values(sb_recording_sources);
-			Pstring->Set_help("Audio source to use when guest is recording audio. At this time only generated audio sources are available.");
+			Pstring->Set_help("Audio source to use when guest is recording audio. Options: silence, hiss, 1khz tone, or microphone (Windows WASAPI input).");
 			Pstring->SetBasic(true);
+
+            Pbool = secprop->Add_bool("prefer hfp", Property::Changeable::WhenIdle, false);
+            Pbool->Set_help(
+                "Prefer Bluetooth HFP (Hands-Free Profile) microphone mode.\n"
+                "This allows using the microphone of a BT headset but reduces\n"
+                "audio quality (typically 8kHz–16kHz telephone quality).\n"
+                "When disabled, higher-quality microphones are preferred."
+            );
+            Pbool->SetBasic(true);
 
 			/* Sound Blaster IRQ hacks.
 			 *
@@ -3801,7 +3908,7 @@ void DOSBOX_SetupConfigSections(void) {
 					"'nuked' is the most accurate (but the most CPU-intensive). See oplrate as well.");
 			Pstring->SetBasic(true);
 
-			Pint = secprop->Add_int("oplrate",Property::Changeable::WhenIdle,48000);
+			Pint = secprop->Add_int("oplrate",Property::Changeable::WhenIdle,49716);
 			Pint->Set_values(rates);
 			Pint->Set_help("Sample rate of OPL music emulation. Use 49716 for highest quality (set the mixer rate accordingly).");
 			Pint->SetBasic(true);
@@ -4497,6 +4604,13 @@ void DOSBOX_SetupConfigSections(void) {
                     "This can help with any program with startup code that assumes the segment wraparound of the 8086.\n"
                     "Depending on DOS configuration the A20 gate may be re-enabled later such as calling INT 21h.");
 
+    Pbool = secprop->Add_bool("break on int3",Property::Changeable::WhenIdle,false);
+    Pbool->Set_help("If set, a breakpoint on INT 3 is automatically set up at startup");
+    Pbool->SetBasic(true);
+
+    Pbool = secprop->Add_bool("xms log memmove",Property::Changeable::WhenIdle,false);
+    Pbool->Set_help("If set, XMS move/copy operations are logged for debugging purposes.");
+
     Pbool = secprop->Add_bool("xms memmove causes flat real mode",Property::Changeable::WhenIdle,true);
     Pbool->Set_help("If set, any call to XMS to move/copy memory sets up flat real mode for segment registers DS and ES.");
 
@@ -4517,6 +4631,14 @@ void DOSBOX_SetupConfigSections(void) {
                     "It is recommended to get and set dosbox-x.conf settings using the CONFIG command instead.\n"
                     "Compatibility with DOSBox SVN can be improved by enabling this option.");
     Pbool->SetBasic(true);
+
+    Pstring = secprop->Add_string("exepack",Property::Changeable::WhenIdle,"unpack");
+    Pstring->Set_values(exepackopts);
+    Pstring->Set_help("If loading an EXE file compressed using ExEPACK, what to do.\n"
+		      "This setting can help avoid Packed File is Corrupt errors when running such executables.\n"
+		      "none = don't do anything\n"
+		      "a20off = switch off the A20 gate before running the executable\n"
+		      "unpack = decompress the EXE and then run it, rather than run the EXEPACK code (default).");
 
     Pstring = secprop->Add_string("badcommandhandler",Property::Changeable::WhenIdle,"");
     Pstring->Set_help("Allow to specify a custom error handler command for the internal DOS shell before the \"Bad command or file name\" message shows up.");
@@ -4623,6 +4745,13 @@ void DOSBOX_SetupConfigSections(void) {
     Pbool->Set_help("Report DOS network redirector as resident. This will allow the host name to be returned unless the secure mode is enabled.\n"
             "You can also directly access UNC network paths in the form \\\\MACHINE\\SHARE even if they are not mounted as drives on Windows systems.\n"
             "Set either \"ipx=true\" in [ipx] section or \"ne2000=true\" in [ne2000] section for a full network redirector environment.");
+    Pbool->SetBasic(true);
+
+    Pbool = secprop->Add_bool("mcb corruption becomes application free memory",Property::Changeable::WhenIdle,false);
+    Pbool->Set_help("If MCB chain corruption occurs following the DOS program PSP segment and the DOS program does anything to cause memory allocation,"
+                    "make a new free memory block in it's place instead of halting emulation with an MCB chain error. Some DOS programs are sloppy"
+                    "with memory to corrupt the MCB chain after itself in memory. This is apparently real MS-DOS behavior, set to true to enable."
+                    "If set to false, all MCB chain corruption will halt emulation as DOSBox forks typically do already.");
     Pbool->SetBasic(true);
 
     Phex = secprop->Add_hex("minimum dos initial private segment", Property::Changeable::WhenIdle,0);

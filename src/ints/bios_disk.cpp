@@ -36,6 +36,13 @@
 # pragma warning(disable:4244) /* const fmath::local::uint64_t to double possible loss of data */
 #endif
 
+#if defined(__linux__) && !defined(__GLIBC__)
+// musl libc does not need 64 suffix to work with files > 2 GiB
+#define fopen64 fopen
+#define fseeko64 fseeko
+#define ftello64 ftello
+#endif
+
 extern unsigned long freec;
 extern const uint8_t freedos_mbr[];
 extern int bootdrive, tryconvertcp;
@@ -1949,7 +1956,9 @@ static Bitu INT13_DiskHandler(void) {
         for(i=0;i<reg_al;i++) {
             last_status = imageDiskList[drivenum]->Read_Sector((uint32_t)reg_dh, (uint32_t)(reg_ch | ((reg_cl & 0xc0)<< 2)), (uint32_t)((reg_cl & 63)+i), sectbuf);
 
-            if (drivenum < 2)
+            if (imageDiskList[drivenum]->class_id == imageDisk::ID_EL_TORITO_FLOPPY)
+                diskio_delay(512);
+            else if (drivenum < 2)
                 diskio_delay(512, 0); // Floppy
             else
                 diskio_delay(512);
@@ -2084,6 +2093,19 @@ static Bitu INT13_DiskHandler(void) {
         break;
     case 0x08: /* Get drive parameters */
         if(driveInactive(drivenum)) {
+            if(drivenum == 0) {
+                // if no floppy drive 0 mounted, return fixed values for 1.44MB drive
+                // This fixes a problem in some DOS applications that occurred when booting from the hard disk without a mounted floppy disk.
+                reg_ax = 0x00;
+                reg_bl = 4;
+                reg_ch = 79;
+                reg_cl = 18;
+                reg_dh = 1;
+                reg_dl = 1;
+                last_status = 0x00;
+                CALLBACK_SCF(false);
+                return CBRET_NONE;
+            }
             last_status = 0x07;
             reg_ah = last_status;
             CALLBACK_SCF(true);
@@ -3765,7 +3787,7 @@ uint8_t imageDiskINT13Drive::Read_Sector(uint32_t head,uint32_t cylinder,uint32_
 
 	if (req_sector_size == 0) req_sector_size = sector_size;
 
-//	LOG_MSG("INT13 read C/H/S %u/%u/%u busy=%u",cylinder,head,sector,busy);
+	//LOG_MSG("INT13 read C/H/S %u/%u/%u busy=%u",cylinder,head,sector,busy);
 
 	if (!busy && sector_size == req_sector_size && sector_size <= INT13XferSize) {
 		busy = true;
@@ -3804,6 +3826,7 @@ again:
 			}
 		}
 		else {
+			ret = 0;
 			MEM_BlockRead32(INT13Xfer<<4,data,sector_size);
 			data = (void*)((char*)data + sector_size);
 			if ((++sector) >= (sectors + 1)) {

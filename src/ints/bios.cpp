@@ -141,6 +141,9 @@ extern bool enable_fpu;
 extern bool finish_prepare;
 extern bool is_ttfswitched_on;
 
+/* vga_pc98_cg.cpp */
+extern bool pc98_cg_kanji_dot_access_mode;
+
 bool pc98_timestamp5c = true; // port 5ch and 5eh "time stamp/hardware wait"
 
 uint32_t Keyb_ig_status();
@@ -812,6 +815,12 @@ void dosbox_integration_trigger_read() {
 			dosbox_int_register = dos_kernel_disabled || !uselfn ? 0: 1;
 			break;
 
+		case DOSBOX_ID_REG_GET_VGA_MEMBASE:
+			dosbox_int_register = S3_LFB_BASE;
+			break;
+		case DOSBOX_ID_REG_GET_VGA_MEMSIZE:
+			dosbox_int_register = vga.mem.memsize;
+			break;
 		case DOSBOX_ID_REG_GET_VGA_SIZE: /* query VGA display size */
 			dosbox_int_register = VGA_QuerySizeIG();
 			break;
@@ -904,6 +913,38 @@ void dosbox_integration_trigger_read() {
 			       dosbox_int_register |= DOSBOX_ID_REG_CPU_CYCLES_INFO_FIXED;
 			break;
 
+		case DOSBOX_ID_REG_VGAIG_CAPS:
+			if (IS_VGA_ARCH && svgaCard == SVGA_DOSBoxIG) {
+				dosbox_int_register = DOSBOX_ID_REG_VGAIG_CAPS_ENABLED;
+			}
+			else {
+				dosbox_int_register = 0;
+			}
+			break;
+
+		case DOSBOX_ID_REG_VGAIG_CTL:
+			/* Windows 3.1 "grabber" driver needs to be able to save/restore the IG registers,
+			 * or perhaps switch on/off things at runtime. */
+			if (IS_VGA_ARCH && svgaCard == SVGA_DOSBoxIG) {
+				dosbox_int_register = vga.dosboxig.ctlreg;
+			}
+			else {
+				dosbox_int_register = 0;
+			}
+			break;
+
+		case DOSBOX_ID_REG_VGAIG_DISPLAYSIZE:
+			dosbox_int_register = vga.dosboxig.width | (vga.dosboxig.height << 16u);
+			break;
+
+		case DOSBOX_ID_REG_VGAIG_RBANKWINDOW:
+			dosbox_int_register = vga.dosboxig.rbank_offset;
+			break;
+
+		case DOSBOX_ID_REG_VGAIG_WBANKWINDOW:
+			dosbox_int_register = vga.dosboxig.wbank_offset;
+			break;
+
 		default:
 			dosbox_int_register = 0xAA55AA55;
 			dosbox_int_error = true;
@@ -938,6 +979,8 @@ void Watchdog_Timer_Set(uint32_t timeout_ms) {
 		PIC_AddEvent(Watchdog_Timeout_Event,(double)timeout_ms);
 	}
 }
+
+void VGA_DOSBoxIG_FmtToVGA(void);
 
 unsigned int mouse_notify_mode = 0;
 // 0 = off
@@ -1139,6 +1182,164 @@ void dosbox_integration_trigger_write() {
 				CAPTURE_WaveEvent(true);
 			break;
 
+		case DOSBOX_ID_REG_VGAIG_CTL: {
+			bool modechange = false;
+			bool mapchange = false;
+			bool pv;
+
+			if (IS_VGA_ARCH && svgaCard == SVGA_DOSBoxIG) {
+				vga.dosboxig.ctlreg = dosbox_int_register;
+
+				pv = vga.dosboxig.svga;
+				vga.dosboxig.svga = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_OVERRIDE);
+				if (vga.dosboxig.svga != pv) modechange = true;
+
+				pv = vga.dosboxig.override_refresh;
+				vga.dosboxig.override_refresh = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_OVERRIDE_REFRESH);
+				if (vga.dosboxig.override_refresh != pv) modechange = true;
+
+				pv = vga.dosboxig.force_A0000;
+				vga.dosboxig.force_A0000 = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_A0000_FORCE);
+				if (vga.dosboxig.force_A0000 != pv) mapchange = true;
+
+				vga.dosboxig.vesa_bios_lockout = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_VBEMODESET_DISABLE);
+				vga.dosboxig.vga_reg_lockout = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_VGAREG_LOCKOUT);
+				vga.dosboxig.vga_acpal_bypass = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_ACPAL_BYPASS);
+				vga.dosboxig.vga_3da_lockout = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_3DA_LOCKOUT);
+				vga.dosboxig.vga_dac_lockout = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_DAC_LOCKOUT);
+
+				if (modechange) {
+					VGA_DetermineMode();
+					VGA_StartResize(0);
+					VGA_DAC_UpdateColorPalette();
+				}
+
+				if (mapchange) {
+					VGA_SetupHandlers();
+				}
+			}
+			break; }
+
+		case DOSBOX_ID_REG_VGAIG_DISPLAYSIZE:
+			{
+				unsigned int nw = dosbox_int_register & 0xFFFFu;
+				unsigned int nh = dosbox_int_register >> 16u;
+
+				if (nw < 16) nw = 16;
+				if (nh < 16) nh = 16;
+				if (nw > vga.max_svga_width) nw = vga.max_svga_width;
+				if (nh > vga.max_svga_height) nh = vga.max_svga_height;
+
+				if (vga.dosboxig.width != nw || vga.dosboxig.height != nh) {
+					vga.dosboxig.width = nw;
+					vga.dosboxig.height = nh;
+					if (vga.dosboxig.svga) VGA_StartResize(0);
+				}
+			}
+			break;
+
+		case DOSBOX_ID_REG_VGAIG_HVTOTALADD:
+			{
+				unsigned int nw = dosbox_int_register & 0xFFFFu;
+				unsigned int nh = dosbox_int_register >> 16u;
+
+				if (vga.dosboxig.wa_total != nw || vga.dosboxig.ha_total != nh) {
+					vga.dosboxig.wa_total = nw;
+					vga.dosboxig.ha_total = nh;
+					if (vga.dosboxig.svga) VGA_StartResize(0);
+				}
+			}
+			break;
+
+		case DOSBOX_ID_REG_VGAIG_FMT_BYTESPERSCANLINE:
+			{
+				unsigned int bpl = dosbox_int_register & 0xFFFFu;
+				unsigned int fmt = (dosbox_int_register >> 16u) & 0xFFu;
+
+				if (vga.dosboxig.vidformat != fmt && fmt != 0xFFu) {
+					vga.dosboxig.vidformat = fmt;
+					if (vga.dosboxig.svga) {
+						VGA_DetermineMode();
+						VGA_StartResize(0);
+					}
+				}
+				if (vga.dosboxig.bytes_per_scanline != bpl) {
+					vga.dosboxig.bytes_per_scanline = bpl;
+					if (vga.dosboxig.svga) VGA_CheckScanLength();
+				}
+			}
+			break;
+
+		case DOSBOX_ID_REG_VGAIG_REFRESHRATE:
+			{
+				uint32_t nr = dosbox_int_register;
+
+				if (nr > (240ul << 16ul)) nr = 240ul << 16ul; /* 240fps is enough! */
+
+				if (vga.dosboxig.vratefp16 != nr) {
+					vga.dosboxig.vratefp16 = nr;
+					if (vga.dosboxig.svga) VGA_StartResize(0);
+				}
+			}
+			break;
+
+		case DOSBOX_ID_REG_VGAIG_DISPLAYOFFSET: {
+			vga.dosboxig.display_offset = dosbox_int_register;
+			break; }
+
+		case DOSBOX_ID_REG_VGAIG_HVPELSCALE: {
+			uint8_t vs = (dosbox_int_register >> 24u) & 0xFFu;
+			uint8_t hs = (dosbox_int_register >> 16u) & 0xFFu;
+			uint8_t vp = (dosbox_int_register >>  8u) & 0xFFu;
+			uint8_t hp =  dosbox_int_register         & 0xFFu;
+			bool modechange = false;
+
+			if (vs != 0xFFu && vga.dosboxig.vscale != vs) { vga.dosboxig.vscale = vs; modechange = true; }
+			if (hs != 0xFFu && vga.dosboxig.hscale != hs) { vga.dosboxig.hscale = hs; modechange = true; }
+			if (vp != 0xFFu && vga.dosboxig.vpel != vp) { vga.dosboxig.vpel = vp; modechange = true; }
+			if (hp != 0xFFu && vga.dosboxig.hpel != hp) { vga.dosboxig.hpel = hp; modechange = true; }
+
+			if (modechange && vga.dosboxig.svga) VGA_StartResize(0);
+			break; }
+
+		case DOSBOX_ID_REG_VGAIG_BANKWINDOW:
+			{
+				uint32_t nr = dosbox_int_register & (~0xFFFul);
+				vga.dosboxig.rbank_offset = nr;
+				vga.dosboxig.wbank_offset = nr;
+				VGA_SetupHandlers();
+			}
+			break;
+
+		case DOSBOX_ID_REG_VGAIG_RBANKWINDOW:
+			{
+				uint32_t nr = dosbox_int_register & (~0xFFFul);
+				vga.dosboxig.rbank_offset = nr;
+				VGA_SetupHandlers();
+			}
+			break;
+
+		case DOSBOX_ID_REG_VGAIG_WBANKWINDOW:
+			{
+				uint32_t nr = dosbox_int_register & (~0xFFFul);
+				vga.dosboxig.wbank_offset = nr;
+				VGA_SetupHandlers();
+			}
+			break;
+
+		case DOSBOX_ID_REG_VGAIG_ASPECTRATIO:
+			{
+				uint16_t w = dosbox_int_register & 0xFFFFu;
+				uint16_t h = dosbox_int_register >> 16u;
+
+				if (vga.dosboxig.dar_width != w || vga.dosboxig.dar_height != h) {
+					vga.dosboxig.dar_width = w;
+					vga.dosboxig.dar_height = h;
+					if (vga.dosboxig.svga) VGA_StartResize(0);
+				}
+			}
+			break;
+
 		case DOSBOX_ID_REG_CPU_CYCLES:
 			ig_cpu_cycles_set |= 1u;
 			ig_cpu_cycles_value = dosbox_int_register;
@@ -1204,6 +1405,12 @@ void dosbox_integration_trigger_write() {
 			dosbox_int_error = true;
 			break;
 	}
+}
+
+void dosbox_integration_trigger_write_direct32(const uint32_t reg,const uint32_t val) {
+	dosbox_int_regsel = reg;
+	dosbox_int_register = val;
+	dosbox_integration_trigger_write();
 }
 
 /* PORT 0x28: Index
@@ -1949,6 +2156,14 @@ void ISAPNP_Cfg_Reset(Section *sec) {
     APMBIOS_allow_realmode = section->Get_bool("apmbios allow realmode");
     APMBIOS_allow_prot16 = section->Get_bool("apmbios allow 16-bit protected mode");
     APMBIOS_allow_prot32 = section->Get_bool("apmbios allow 32-bit protected mode");
+
+    /* The DOSBox Integration Graphics require the integration device */
+    if (IS_VGA_ARCH && svgaCard == SVGA_DOSBoxIG) {
+        if (!enable_integration_device) {
+            LOG(LOG_MISC,LOG_WARN)("Machine type is SVGA DOSBox Integrated Graphics, which requires integration device. Enabling it.");
+            enable_integration_device = true;
+        }
+    }
 
     std::string apmbiosver = section->Get_string("apmbios version");
 
@@ -3997,7 +4212,7 @@ static Bitu INT18_PC98_Handler(void) {
                 0       25lines     20lines
                 1       80cols      40cols
                 2       v.lines     simp.graphics
-                3       K-CG access mode(not used in PC-98) */
+                3       K-CG access mode(not available on original PC-9801) */
             
             //TODO: set 25/20 lines mode and 80/40 columns mode.
             //Attribute bit (bit 2)
@@ -4009,8 +4224,7 @@ static Bitu INT18_PC98_Handler(void) {
 
             mem_writeb(0x53C,(mem_readb(0x53C) & 0xF0u) | (reg_al & 0x0Fu));
 
-            if (reg_al & 8)
-                LOG_MSG("INT 18H AH=0Ah warning: K-CG dot access mode not supported");
+            pc98_cg_kanji_dot_access_mode = !!(reg_al & 8);
 
             pc98_update_text_lineheight_from_bda();
             pc98_update_text_layer_lineheight_from_bda();
@@ -4023,7 +4237,7 @@ static Bitu INT18_PC98_Handler(void) {
                 0       25lines     20lines
                 1       80cols      40cols
                 2       v.lines     simp.graphics
-                3       K-CG access mode(not used in PC-98) 
+                3       K-CG access mode(not available on original PC-9801)
                 7       std CRT     hi-res CRT */
             /* NTS: I assume that real hardware doesn't offer a way to read back the state of these bits,
              *      so the BIOS's only option is to read the mode byte back from the data area.
@@ -5916,42 +6130,49 @@ Table            [Programmable key setting data buffer structure]
                 update_pc98_function_row(pc98_function_row_mode,true);
                 goto done;
             }
-            else if (reg_ax >= 0x01 && reg_ax <= 0x0A) { /* Read individual function keys, DS:DX = data to set */
+            else if (reg_ax >= 0x01 && reg_ax <= 0x0A) { /* Write individual function keys, DS:DX = data to set */
                 Bitu ofs = (Bitu)(SegValue(ds) << 4ul) + (Bitu)reg_dx;
                 INTDC_LOAD_FUNCDEC(pc98_func_key[reg_ax - 0x01],ofs);
+                update_pc98_function_row(pc98_function_row_mode,true);
                 goto done;
             }
-            else if (reg_ax >= 0x0B && reg_ax <= 0x14) { /* Read individual shift + function keys, DS:DX = data to set */
+            else if (reg_ax >= 0x0B && reg_ax <= 0x14) { /* Write individual shift + function keys, DS:DX = data to set */
                 Bitu ofs = (Bitu)(SegValue(ds) << 4ul) + (Bitu)reg_dx;
                 INTDC_LOAD_FUNCDEC(pc98_func_key_shortcut[reg_ax - 0x0B],ofs);
+                update_pc98_function_row(pc98_function_row_mode,true);
                 goto done;
             }
-            else if (reg_ax >= 0x15 && reg_ax <= 0x1F) { /* Read individual editor keys, DS:DX = data to set */
+            else if (reg_ax >= 0x15 && reg_ax <= 0x1F) { /* Write individual editor keys, DS:DX = data to set */
                 Bitu ofs = (Bitu)(SegValue(ds) << 4ul) + (Bitu)reg_dx;
                 INTDC_LOAD_EDITDEC(pc98_editor_key_escapes[reg_ax - 0x15],ofs);
+                update_pc98_function_row(pc98_function_row_mode,true);
                 goto done;
             }
-            else if (reg_ax >= 0x20 && reg_ax <= 0x24) { /* Read VF1-VF5 keys, DS:DX = data to store to */
+            else if (reg_ax >= 0x20 && reg_ax <= 0x24) { /* Write VF1-VF5 keys, DS:DX = data to set */
                 Bitu ofs = (Bitu)(SegValue(ds) << 4ul) + (Bitu)reg_dx;
                 INTDC_LOAD_FUNCDEC(pc98_vfunc_key[reg_ax - 0x20],ofs);
+                update_pc98_function_row(pc98_function_row_mode,true);
                 goto done;
             }
-            else if (reg_ax >= 0x25 && reg_ax <= 0x29) { /* Read shift VF1-VF5 keys, DS:DX = data to store to */
+            else if (reg_ax >= 0x25 && reg_ax <= 0x29) { /* Write shift VF1-VF5 keys, DS:DX = data to set */
                 Bitu ofs = (Bitu)(SegValue(ds) << 4ul) + (Bitu)reg_dx;
                 INTDC_LOAD_FUNCDEC(pc98_vfunc_key_shortcut[reg_ax - 0x25],ofs);
+                update_pc98_function_row(pc98_function_row_mode,true);
                 goto done;
             }
-            else if (reg_ax >= 0x2A && reg_ax <= 0x33) { /* Read individual function keys, DS:DX = data to store to */
+            else if (reg_ax >= 0x2A && reg_ax <= 0x33) { /* Write individual function keys, DS:DX = data to set */
                 Bitu ofs = (Bitu)(SegValue(ds) << 4ul) + (Bitu)reg_dx;
                 INTDC_LOAD_FUNCDEC(pc98_func_key_ctrl[reg_ax - 0x2A],ofs);
+                update_pc98_function_row(pc98_function_row_mode,true);
                 goto done;
             }
-            else if (reg_ax >= 0x34 && reg_ax <= 0x38) { /* Read control VF1-VF5 keys, DS:DX = data to store to */
+            else if (reg_ax >= 0x34 && reg_ax <= 0x38) { /* Write control VF1-VF5 keys, DS:DX = data to set */
                 Bitu ofs = (Bitu)(SegValue(ds) << 4ul) + (Bitu)reg_dx;
                 INTDC_LOAD_FUNCDEC(pc98_vfunc_key_ctrl[reg_ax - 0x34],ofs);
+                update_pc98_function_row(pc98_function_row_mode,true);
                 goto done;
             }
-            else if (reg_ax == 0x00) { /* Read all state, DS:DX = data to set */
+            else if (reg_ax == 0x00) { /* Write all state, DS:DX = data to set */
                 /* DS:DX contains
                  *       16*10 bytes, 16 bytes per entry for function keys F1-F10
                  *       16*10 bytes, 16 bytes per entry for function key shortcuts Shift+F1 to Shift+F10
@@ -8334,7 +8555,9 @@ extern uint32_t tandy_128kbase;
 static int bios_post_counter = 0;
 
 extern void BIOSKEY_PC98_Write_Tables(void);
+#if !defined(OSFREE)
 extern Bitu PC98_AVSDRV_PCM_Handler(void);
+#endif
 
 static unsigned int acpiptr2ofs(unsigned char *w) {
 	return w - ACPI_buffer;
@@ -10214,8 +10437,10 @@ private:
                 }
             }
 
+#if !defined(OSFREE)
             callback_pc98_avspcm.Install(&PC98_AVSDRV_PCM_Handler,CB_IRET,"AVSDRV.SYS PCM driver");
             callback_pc98_avspcm.Set_RealVec(0xd9, true);
+#endif
         }
 
         if (IS_PC98_ARCH) {
@@ -10950,6 +11175,9 @@ startfunction:
         if (IS_VGA_ARCH) {
             reg_eax = 18;       // 640x480 16-color
             CALLBACK_RunRealInt(0x10);
+
+            if (svgaCard == SVGA_DOSBoxIG)
+                VGA_StartUpdateLFB();
         }
         else if (machine == MCH_PC98) {
             // clear the graphics layer
@@ -11033,6 +11261,7 @@ startfunction:
              * indicated in the filename. There are multiple versions, one for each vertical resolution of common
              * CGA/EGA/VGA/etc. modes: 480-line, 400-line, 350-line, and 200-line. All images other than the 480-line
              * one have a non-square pixel aspect ratio. Please take that into consideration. */
+            /* 2026/03/29: You can now put it in the DOSBox config directory in your home directory as well. */
             if (IS_VGA_ARCH) {
                 if (logo) user_filename = std::string(logo) + "224x224.png";
                 filename = "dosbox224x224.png";
@@ -11076,6 +11305,12 @@ startfunction:
                 inpng = dosbox224x93_png;
             }
 
+            const std::string configdir = Cross::GetPlatformConfigDir();
+
+            if (png_fp == NULL && !configdir.empty() && !user_filename.empty())
+                png_fp = fopen((configdir + user_filename).c_str(),"rb");
+            if (png_fp == NULL && !configdir.empty() && filename != NULL)
+                png_fp = fopen((configdir + filename).c_str(),"rb");
             if (png_fp == NULL && !user_filename.empty())
                 png_fp = fopen(user_filename.c_str(),"rb");
             if (png_fp == NULL && filename != NULL)
@@ -11274,6 +11509,9 @@ startfunction:
                             case ATI_Mach64:           card = "ATI Mach64"; break;
                         }
                         break;
+                    case SVGA_DOSBoxIG:
+                        card = "DOSBox Integrated Graphics";
+                        break;
                     default:
                         card = "Standard VGA";
                         break;
@@ -11355,6 +11593,10 @@ startfunction:
         if (ISAPNPBIOS) {
             BIOS_Int10RightJustifiedPrint(x,y,"ISA Plug & Play BIOS active\n");
         }
+
+#if defined(OSFREE)
+        BIOS_Int10RightJustifiedPrint(x,y,"OS-FREE BUILD\n");
+#endif
 
         if (*logo_text) {
             const size_t max_w = 76;

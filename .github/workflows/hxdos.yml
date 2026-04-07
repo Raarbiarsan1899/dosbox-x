@@ -18,10 +18,10 @@ jobs:
         shell: pwsh
     steps:
       - name: Cancel previous runs
-        uses: styfle/cancel-workflow-action@0.12.1
+        uses: styfle/cancel-workflow-action@0.13.1
         with:
           access_token: ${{ github.token }}
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Prepare HX-DOS
         shell: bash
         run: |
@@ -46,6 +46,10 @@ jobs:
           echo "#define GIT_COMMIT_HASH \"${shortsha}\""  >> include/build_timestamp.h
           echo "#define COPYRIGHT_END_YEAR \"${copyrightyear}\"" >> include/build_timestamp.h
           cat include/build_timestamp.h
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION=$(echo "${GITHUB_REF##*/}" | sed -E 's/^dosbox-x-v([0-9]+\.[0-9]+\.[0-9]+)$/\1/' || echo "unknown")
+            echo "VERSION=$VERSION" >> $GITHUB_ENV
+          fi
       - name: Build HX-DOS
         shell: pwsh
         run: |
@@ -79,7 +83,14 @@ jobs:
           mkdir -p $top/package/language
           cp $top/contrib/translations/*/*.lng $top/package/language/
           cd $top/package/
-          $top/vs/tool/zip.exe -r -9 $top/dosbox-x-mingw-hx-dos-${{ env.timestamp }}.zip *
+          TIMESTAMP="${{ env.timestamp }}"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            ZIPNAME="dosbox-x-hx-dos-${VERSION}.zip"
+            $top/vs/tool/zip.exe -r -9 "$top/$ZIPNAME" *
+          else
+            ZIPNAME="dosbox-x-hx-dos-${TIMESTAMP}-nightly"
+          fi
+          echo "ZIPNAME=$ZIPNAME" >> $GITHUB_ENV
           cd $top
       - name: Wait for VS 32bit build to finish (Release only)
         if: startsWith(github.ref, 'refs/tags/')
@@ -104,12 +115,12 @@ jobs:
           cat $top/OUTPUT.TXT
           test -f $top/SUCCESS.TXT || (echo The HX-DOS build did not run successfully && exit 1)
       - name: Upload preview package
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@v7.0.0
         with:
-          name: dosbox-x-mingw-hx-dos-${{ env.timestamp }}
+          name: ${{ env.ZIPNAME }}
           path: ${{ github.workspace }}/package/
       - name: Upload release package
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: dosbox-x-mingw-hx-dos-${{ env.timestamp }}.zip
+          files: ${{ env.ZIPNAME }}

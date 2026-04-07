@@ -28,23 +28,30 @@
 // uncomment for alloc/free debug messages
 #define DEBUG_ALLOC
 
+extern bool auto_repair_dos_psp_mcb_corruption;
+
+uint16_t CONV_MAX_SEG = 0xA000;
 Bitu UMB_START_SEG = 0x9FFF;
 /* FIXME: This should be a variable that reflects the last RAM segment.
  *        That means 0x9FFF if 640KB or more, or a lesser value if less than 640KB */
 //#define UMB_START_SEG 0x9fff
 
+#if !defined(OSFREE)
 uint16_t first_umb_seg = 0xd000;
 uint16_t first_umb_size = 0x2000;
+#endif
 
 static uint16_t memAllocStrategy = 0x00;
 
-static void DOS_Mem_E_Exit(const char *msg) {
-	uint16_t mcb_segment=dos.firstMCB;
+void DOS_Mem_MCBdump(void) {
+	uint16_t mcb_segment=dos_kernel_disabled ? guest_msdos_mcb_chain : dos.firstMCB;
 	DOS_MCB mcb(mcb_segment);
 	DOS_MCB mcb_next(0);
 	Bitu counter=0;
 	char name[10];
 	char c;
+
+	if (mcb_segment == 0) return;
 
 	LOG_MSG("DOS MCB dump:\n");
 	while ((c=(char)mcb.GetType()) != 'Z') {
@@ -52,9 +59,12 @@ static void DOS_Mem_E_Exit(const char *msg) {
 		if (c != 'M') break;
 
 		mcb.GetFileName(name);
-		LOG_MSG(" Type=0x%02x(%c) Seg=0x%04x size=0x%04x name='%s'\n",
+		LOG_MSG(" Type=0x%02x(%c) Seg=0x%04x size=0x%04x PSP=0x%04x name='%s'\n",
 			mcb.GetType(),c,
-			mcb_segment+1,mcb.GetSize(),name);
+			mcb_segment+1,
+			mcb.GetSize(),
+			mcb.GetPSPSeg(),
+			name);
 		mcb_next.SetPt((uint16_t)(mcb_segment+mcb.GetSize()+1));
 		mcb_segment+=mcb.GetSize()+1;
 		mcb.SetPt(mcb_segment);
@@ -62,19 +72,23 @@ static void DOS_Mem_E_Exit(const char *msg) {
 
 	mcb.GetFileName(name);
 	c = (char)mcb.GetType(); if (c < 32) c = '.';
-	LOG_MSG("FINAL: Type=0x%02x(%c) Seg=0x%04x size=0x%04x name='%s'\n",
-		mcb.GetType(),c,mcb_segment+1,mcb.GetSize(),name);
+	LOG_MSG("FINAL: Type=0x%02x(%c) Seg=0x%04x size=0x%04x PSP=0x%04x name='%s'\n",
+		mcb.GetType(),c,mcb_segment+1,mcb.GetSize(),mcb.GetPSPSeg(),name);
 	LOG_MSG("End dump\n");
+}
+
+static void DOS_Mem_E_Exit(const char *msg) {
+	DOS_Mem_MCBdump();
 
 #if C_DEBUG
-    LOG_MSG("DOS fatal memory error: %s",msg);
-    throw int(7); // DOS non-fatal error (restart when debugger runs again)
+	LOG_MSG("DOS fatal memory error: %s",msg);
+	throw int(7); // DOS non-fatal error (restart when debugger runs again)
 #else
 	E_Exit("%s",msg);
 #endif
 }
 
-void DOS_CompressMemory(uint16_t first_segment=0/*default*/) {
+void DOS_CompressMemory(uint16_t first_segment=0/*default*/,uint32_t healfrom=0xFFFFu) {
 	uint16_t mcb_segment=dos.firstMCB;
 	DOS_MCB mcb(mcb_segment);
 	DOS_MCB mcb_next(0);
@@ -82,8 +96,26 @@ void DOS_CompressMemory(uint16_t first_segment=0/*default*/) {
 
 	while (mcb.GetType()!='Z') {
 		if(counter++ > 10000000) DOS_Mem_E_Exit("DOS_CompressMemory: DOS MCB list corrupted.");
-		mcb_next.SetPt((uint16_t)(mcb_segment+mcb.GetSize()+1));
-		if (GCC_UNLIKELY((mcb_next.GetType()!=0x4d) && (mcb_next.GetType()!=0x5a))) DOS_Mem_E_Exit("Corrupt MCB chain");
+		const uint16_t nseg = (uint16_t)(mcb_segment+mcb.GetSize()+1); 
+		mcb_next.SetPt(nseg);
+		if (GCC_UNLIKELY((mcb_next.GetType()!=0x4d) && (mcb_next.GetType()!=0x5a))) {
+			/* there are some programs that chain load other programs, but when they shrink their MCB down
+			 * to their EXE resident size they put the stack or other data in the way of the next MCB free
+			 * block header. Real MS-DOS appears in this case to just scan up to the last valid block and
+			 * then right after it, write a new free MCB block there. We can't do this for the split memory
+			 * layout of the PCjr emulation. */
+			if (auto_repair_dos_psp_mcb_corruption && nseg >= healfrom && (nseg+1u) < CONV_MAX_SEG && !(machine==MCH_PCJR)) {
+				LOG(LOG_DOSMISC,LOG_ERROR)("Corrupted MCB chain, but within the possible memory region of the DOS application.");
+				DOS_Mem_MCBdump();
+				LOG(LOG_DOSMISC,LOG_ERROR)("Declaring all memory past it as a free block. This is apparently MS-DOS behavior.");
+				mcb_next.SetSize(CONV_MAX_SEG - (nseg + 1u));
+				mcb_next.SetPSPSeg(MCB_FREE);
+				mcb_next.SetType('Z');
+			}
+			else {
+				DOS_Mem_E_Exit("Corrupt MCB chain");
+			}
+		}
 		if (mcb_segment >= first_segment && (mcb.GetPSPSeg()==MCB_FREE) && (mcb_next.GetPSPSeg()==MCB_FREE)) {
 			mcb.SetSize(mcb.GetSize()+mcb_next.GetSize()+1);
 			mcb.SetType(mcb_next.GetType());
@@ -139,8 +171,11 @@ bool DOS_SetMemAllocStrategy(uint16_t strat) {
 	return false;
 }
 
+#if !defined(OSFREE)
 extern bool dbg_zero_on_dos_allocmem;
+#endif
 
+#if !defined(OSFREE)
 void DOS_zeromem(uint16_t seg,uint16_t para) {
 	uint32_t ofs,cnt;
 
@@ -154,21 +189,22 @@ void DOS_zeromem(uint16_t seg,uint16_t para) {
 		cnt--;
 	}
 }
+#endif
 
 static uint16_t GetMaximumMCBFreeSize(uint16_t mcb_segment)
 {
 	uint16_t largestSize = 0;
 	DOS_MCB mcb(mcb_segment);
-    uint16_t last_mcb_segment;
+	uint16_t last_mcb_segment;
 	for (bool endOfChain = false; !endOfChain; mcb.SetPt(mcb_segment))
 	{
 		auto size = mcb.GetSize();
 		if (mcb.GetPSPSeg()==MCB_FREE) largestSize = (std::max)(largestSize, size);
 		endOfChain = DOS_MCB::MCBType(mcb.GetType())==DOS_MCB::MCBType::LastBlock;
-        last_mcb_segment = mcb_segment;
+		last_mcb_segment = mcb_segment;
 		mcb_segment += size+1;
-        if (mcb_segment == last_mcb_segment) // Check for infinite loop
-            break;
+		if (mcb_segment == last_mcb_segment) // Check for infinite loop
+			break;
 	}
 	return largestSize;
 }
@@ -184,7 +220,12 @@ uint16_t DOS_GetMaximumFreeSize(uint16_t minBlocks)
 }
 
 bool DOS_AllocateMemory(uint16_t * segment,uint16_t * blocks) {
-	DOS_CompressMemory();
+	DOS_MCB psp_mcb(dos.psp()-1);
+
+	DOS_CompressMemory(
+		0/*default scan*/,
+		dos.psp()+psp_mcb.GetSize()/*auto-heal broken MCB chain if it occurs anywhere past the PSP memory block*/);
+
 	uint16_t bigsize=0;
 	uint16_t mem_strat=memAllocStrategy;
 	uint16_t mcb_segment=dos.firstMCB;
@@ -197,7 +238,6 @@ bool DOS_AllocateMemory(uint16_t * segment,uint16_t * blocks) {
 
 	DOS_MCB mcb(0);
 	DOS_MCB mcb_next(0);
-	DOS_MCB psp_mcb(dos.psp()-1);
 	char psp_name[9];
 	psp_mcb.GetFileName(psp_name);
 	if (umb_start==UMB_START_SEG && (dos.loaded_codepage == 936 || dos.loaded_codepage == 950 || dos.loaded_codepage == 951)) {
@@ -221,7 +261,9 @@ bool DOS_AllocateMemory(uint16_t * segment,uint16_t * blocks) {
 				mcb.SetPSPSeg(dos.psp());
 				*segment=mcb_segment+1;
 
+#if !defined(OSFREE)
 				if (dbg_zero_on_dos_allocmem) DOS_zeromem(*segment,*blocks);
+#endif
 #ifdef DEBUG_ALLOC
 				LOG(LOG_DOSMISC,LOG_DEBUG)("DOS_AllocateMemory(blocks=0x%04x) = 0x%04x-0x%04x",*blocks,*segment,*segment+*blocks-1);
 #endif
@@ -240,7 +282,9 @@ bool DOS_AllocateMemory(uint16_t * segment,uint16_t * blocks) {
 						//TODO Filename
 						*segment=mcb_segment+1;
 
+#if !defined(OSFREE)
 						if (dbg_zero_on_dos_allocmem) DOS_zeromem(*segment,*blocks);
+#endif
 #ifdef DEBUG_ALLOC
 						LOG(LOG_DOSMISC,LOG_DEBUG)("DOS_AllocateMemory(blocks=0x%04x) = 0x%04x-0x%04x",*blocks,*segment,*segment+*blocks-1);
 #endif
@@ -295,7 +339,9 @@ bool DOS_AllocateMemory(uint16_t * segment,uint16_t * blocks) {
 							mcb.SetFileName(psp_name);
 							*segment = found_seg+1;
 
+#if !defined(OSFREE)
 							if (dbg_zero_on_dos_allocmem) DOS_zeromem(*segment,*blocks);
+#endif
 #ifdef DEBUG_ALLOC
 							LOG(LOG_DOSMISC,LOG_DEBUG)("DOS_AllocateMemory(blocks=0x%04x) = 0x%04x-0x%04x",*blocks,*segment,*segment+*blocks-1);
 #endif
@@ -313,7 +359,9 @@ bool DOS_AllocateMemory(uint16_t * segment,uint16_t * blocks) {
 						mcb.SetType(0x4D);
 					}
 
+#if !defined(OSFREE)
 					if (dbg_zero_on_dos_allocmem) DOS_zeromem(*segment,*blocks);
+#endif
 #ifdef DEBUG_ALLOC
 					LOG(LOG_DOSMISC,LOG_DEBUG)("DOS_AllocateMemory(blocks=0x%04x) = 0x%04x-0x%04x",*blocks,*segment,*segment+*blocks-1);
 #endif
@@ -328,7 +376,7 @@ bool DOS_AllocateMemory(uint16_t * segment,uint16_t * blocks) {
 	}
 
 #ifdef DEBUG_ALLOC
-	LOG(LOG_DOSMISC,LOG_DEBUG)("DOS_AllocateMemory(blocks=0x%04x) = 0x%04x-0x%04x",*blocks,*segment,*segment+*blocks-1);
+	LOG(LOG_DOSMISC,LOG_DEBUG)("DOS_AllocateMemory(blocks=0x%04x) = 0x%04x-0x%04x failed",*blocks,*segment,*segment+*blocks-1);
 #endif
 	return false;
 }
@@ -357,18 +405,22 @@ bool DOS_ResizeMemory(uint16_t segment,uint16_t * blocks) {
 		return false;
 	}
 
+	/* MS-DOS is documented to combine free blocks at or after this block. Also to avoid combining free blocks in a way
+	 * that might invalidate the mcb() block we just constructed. */
 	uint16_t total=mcb.GetSize();
-	DOS_MCB	mcb_next(segment+total);
+	DOS_CompressMemory(segment-1);
 
-	if (*blocks > total)
-		DOS_CompressMemory(segment-1);
-	else
-		DOS_CompressMemory();
+	/* DOS_CompressMemory() may change the MCB block size if this is a free block when it combines consecutive free blocks.
+	 * If you don't think this could be a free block, understand that there are DOS applications and games out there
+	 * that like to allocate memory by resizing a previously freed block. The Tandy version of California Games II
+	 * does this, for example, as does (noted behlow) some Demoscene code. */
+	total=mcb.GetSize();
+	DOS_MCB	mcb_next(segment+total);
 
 	if (*blocks<=total) {
 		if (GCC_UNLIKELY(*blocks==total)) {
 			/* Nothing to do, however if the block is freed, canonical MS-DOS behavior is to assign your PSP segment as if allocated (Incentiv by DID, party '94) */
-			if (mcb.GetPSPSeg()==MCB_FREE && freed_mcb_allocate_on_resize)
+			if (mcb.GetPSPSeg()==MCB_FREE)
 				mcb.SetPSPSeg(dos.psp());
 
 			return true;
@@ -418,8 +470,15 @@ bool DOS_ResizeMemory(uint16_t segment,uint16_t * blocks) {
 	}
 
 	mcb.SetSize(total);
-	mcb.SetPSPSeg(dos.psp());
-	if (*blocks==total) return true;	/* block fit exactly */
+	if (*blocks==total) {
+		/* block fit exactly */
+		mcb.SetPSPSeg(dos.psp());
+		return true;
+	}
+
+#ifdef DEBUG_ALLOC
+	LOG(LOG_DOSMISC,LOG_DEBUG)("DOS_ResizeMemory(seg=0x%04x) failed, maximum 0x%04x available",segment,(unsigned int)total);
+#endif
 
 	*blocks=total;	/* return maximum */
 	DOS_SetError(DOSERR_INSUFFICIENT_MEMORY);
@@ -428,13 +487,13 @@ bool DOS_ResizeMemory(uint16_t segment,uint16_t * blocks) {
 
 
 bool DOS_FreeMemory(uint16_t segment) {
-//TODO Check if allowed to free this segment
+	//TODO Check if allowed to free this segment
 	if (segment < DOS_MEM_START+1) {
 		LOG(LOG_DOSMISC,LOG_ERROR)("Program tried to free %X ---ERROR",segment);
 		DOS_SetError(DOSERR_MB_ADDRESS_INVALID);
 		return false;
 	}
-      
+
 	DOS_MCB mcb(segment-1);
 	if ((mcb.GetType()!=0x4d) && (mcb.GetType()!=0x5a)) {
 		DOS_SetError(DOSERR_MB_ADDRESS_INVALID);
@@ -446,19 +505,20 @@ bool DOS_FreeMemory(uint16_t segment) {
 #endif
 
 	mcb.SetPSPSeg(MCB_FREE);
-//	DOS_CompressMemory();
+	//	DOS_CompressMemory();
 	return true;
 }
 
 Bitu GetEMSPageFrameSegment(void);
 
+#if !defined(OSFREE)
 void DOS_BuildUMBChain(bool umb_active,bool /*ems_active*/) {
 	unsigned int seg_limit = (unsigned int)(MEM_ConventionalPages()*256);
 
 	/* UMBs are only possible if the machine has 1MB+64KB of RAM */
 	if (umb_active && (machine!=MCH_TANDY) && seg_limit >= (0x10000+0x1000-1) && first_umb_seg < GetEMSPageFrameSegment()) {
-        /* XMS emulation sets UMB size now.
-         * PCjr mode disables UMB emulation */
+		/* XMS emulation sets UMB size now.
+		 * PCjr mode disables UMB emulation */
 #if 0
 		if (ems_active) {
 			/* we can use UMBs up to the EMS page frame */
@@ -501,8 +561,10 @@ void DOS_BuildUMBChain(bool umb_active,bool /*ems_active*/) {
 		dos_infoblock.SetUMBChainState(0);
 	}
 }
+#endif
 
 bool DOS_LinkUMBsToMemChain(uint16_t linkstate) {
+#if !defined(OSFREE)
 	/* Get start of UMB-chain */
 	uint16_t umb_start=dos_infoblock.GetStartOfUMBChain();
 	if (umb_start!=UMB_START_SEG) {
@@ -517,7 +579,7 @@ bool DOS_LinkUMBsToMemChain(uint16_t linkstate) {
 	}
 
 	if ((linkstate&1)==(dos_infoblock.GetUMBChainState()&1)) return true;
-	
+
 	/* Scan MCB-chain for last block before UMB-chain */
 	uint16_t mcb_segment=dos.firstMCB;
 	uint16_t prev_mcb_segment=dos.firstMCB;
@@ -554,6 +616,9 @@ bool DOS_LinkUMBsToMemChain(uint16_t linkstate) {
 	}
 
 	return true;
+#else
+	return false;
+#endif
 }
 
 
@@ -636,6 +701,7 @@ void DOS_SetupMemory(void) {
 		/* map memory as normal, the BIOS initialization is the code responsible
 		 * for subtracting 32KB from top of system memory for video memory. */
 		mcb.SetSize(/*normally 0x97FF*/(seg_limit-1) - DOS_MEM_START - mcb_sizes);
+		CONV_MAX_SEG = seg_limit;
 	} else if (machine==MCH_PCJR) {
 		/* If there is more than 128KB of RAM, then the MCB chain must be constructed
 		 * to exclude video memory. In that case, the BIOS values in the BDA will report
@@ -652,6 +718,7 @@ void DOS_SetupMemory(void) {
 			mcb_devicedummy.SetPSPSeg(MCB_FREE);
 			mcb_devicedummy.SetSize(/*0x9FFF*/(seg_limit-1) - 0x2000);
 			mcb_devicedummy.SetType(0x5a);
+			CONV_MAX_SEG = seg_limit;
 
 			/* exclude PCJr graphics region */
 			mcb_devicedummy.SetPt((uint16_t)0x17ff);
@@ -666,6 +733,7 @@ void DOS_SetupMemory(void) {
 		else {
 			/* Normal MCB chain, nothing special */
 			mcb.SetSize(/*normally 0x97FF*/(seg_limit-1) - DOS_MEM_START - mcb_sizes);
+			CONV_MAX_SEG = seg_limit;
 		}
 	} else {
 #ifndef DEBUG_ALLOC
@@ -680,6 +748,7 @@ void DOS_SetupMemory(void) {
 		/* complete memory up to 640k available */
 		/* last paragraph used to add UMB chain to low-memory MCB chain */
 		mcb.SetSize(/*0x9FFE*/(seg_limit-2) - DOS_MEM_START - mcb_sizes);
+		CONV_MAX_SEG = seg_limit-1;
 	}
 
 	dos.firstMCB=DOS_MEM_START;

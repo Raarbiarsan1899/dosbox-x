@@ -53,6 +53,13 @@
 #include "shellapi.h"
 #endif
 
+#if defined(OS2)
+#define INCL_DOSPROCESS
+#define INCL_DOSERRORS
+#define INCL_WIN
+#include <os2.h>
+#endif
+
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -109,6 +116,11 @@ extern bool                 MSG_Write(const char *, const char *);
 extern void                 LoadMessageFile(const char * fname);
 extern void                 GFX_SetTitle(int32_t cycles, int frameskip, Bits timing, bool paused);
 
+#if defined(MACOSX) && defined(C_SDL2) && C_METAL
+void OUTPUT_Metal_Shutdown();
+void change_output(int);
+#endif
+
 static int                  cursor;
 static bool                 running;
 static int                  saved_bpp;
@@ -151,15 +163,25 @@ void getlogtext(std::string &str), getcodetext(std::string &text), ApplySetting(
 void ttf_switch_on(bool ss=true), ttf_switch_off(bool ss=true), setAspectRatio(Section_prop * section), GFX_ForceRedrawScreen(void), SetWindowTransparency(int trans);
 bool CheckQuit(void), OpenGL_using(void);
 char tmp1[CROSS_LEN*2], tmp2[CROSS_LEN];
+#if !defined(OSFREE)
 const char *aboutmsg = "DOSBox-X ver." VERSION " (" OS_PLATFORM " " SDL_STRING " " OS_BIT "-bit)\n" \
                        "Build date/time: " UPDATED_STR "\nCopyright 2011-" COPYRIGHT_END_YEAR \
                        " The DOSBox-X Team\nProject maintainer: joncampbell123\nDOSBox-X homepage: https://dosbox-x.com";
+#else
+const char *aboutmsg = "DOSBox-X ver." VERSION " (" OS_PLATFORM " " SDL_STRING " " OS_BIT "-bit) OS-FREE\n" \
+                       "Build date/time: " UPDATED_STR "\nCopyright 2011-" COPYRIGHT_END_YEAR \
+                       " The DOSBox-X Team\nProject maintainer: joncampbell123\nDOSBox-X homepage: https://dosbox-x.com";
+#endif
 
 void RebootConfig(std::string filename, bool confirm=false) {
     std::string exepath=GetDOSBoxXPath(true), para="-conf \""+filename+"\"";
     if ((!confirm||CheckQuit())&&exepath.size()) {
 #if defined(WIN32)
         ShellExecute(NULL, "open", exepath.c_str(), para.c_str(), NULL, SW_NORMAL);
+#elif defined(OS2)
+        char LoadError[CCHMAXPATH] = {0};
+        RESULTCODES result;
+        DosExecPgm(LoadError, sizeof(LoadError), EXEC_ASYNC, (PSZ)para.c_str(), NULL, &result, (PSZ)exepath.c_str());
 #else
         system((exepath+" "+para+ " &").c_str());
 #endif
@@ -178,6 +200,10 @@ void RebootLanguage(std::string filename, bool confirm=false) {
         if (control->PrintConfig(tmpconfig.c_str(),false,true)&&!stat(tmpconfig.c_str(), &st)) para="-conf "+tmpconfig+" -eraseconf "+para;
 #if defined(WIN32)
         ShellExecute(NULL, "open", exepath.c_str(), para.c_str(), NULL, SW_NORMAL);
+#elif defined(OS2)
+        char LoadError[CCHMAXPATH] = {0};
+        RESULTCODES result;
+        DosExecPgm(LoadError, sizeof(LoadError), EXEC_ASYNC, (PSZ)para.c_str(), NULL, &result, (PSZ)exepath.c_str());
 #else
         system((exepath+" "+para+ " &").c_str());
 #endif
@@ -197,8 +223,11 @@ static void getPixel(Bits x, Bits y, int &r, int &g, int &b, int shift)
     if (x < 0) x = 0;
     if (y < 0) y = 0;
 
-    uint8_t* src = (uint8_t *)&scalerSourceCache;
     uint32_t pixel;
+    uint8_t* src = (uint8_t *)scalerSourceCacheBuffer;
+
+    if (!src) return;
+
     switch (render.scale.inMode) {
         case scalerMode8:
             pixel = *((unsigned int)x+(uint8_t*)(src+(unsigned int)y*(unsigned int)render.scale.cachePitch));
@@ -2001,9 +2030,9 @@ public:
         }
         if (arg == MSG_Get("USE_USERCONFIG")) {
             std::string config_path;
-            Cross::GetPlatformConfigDir(config_path);
+            config_path = Cross::GetPlatformConfigDir();
             std::string fullpath,file;
-            Cross::GetPlatformConfigName(file);
+            file = Cross::GetPlatformConfigName();
             const size_t last_slash_idx = config_path.find_last_of("\\/");
             if (std::string::npos != last_slash_idx) {
                 fullpath = config_path.substr(0, last_slash_idx);
@@ -2574,13 +2603,22 @@ public:
     ShowMidiDevice(GUI::Screen *parent, int x, int y, const char *title) :
         ToplevelWindow(parent, x, y, 320, 260, title) {
             std::string name=!midi.handler||!midi.handler->GetName()?"-":midi.handler->GetName();
+            std::string sf_rom{};
             if (name.size()) {
-                if (name=="mt32") name="MT32";
-                else if (name=="fluidsynth") name="FluidSynth";
+                if(name == "mt32") {
+                    name = "MT32";
+                    sf_rom = "\nMT32 ROM path:\n" + sffile;
+                }
+                else if(name == "fluidsynth") {
+                    name = "FluidSynth";
+                    sf_rom = "\nSoundFont file:\n" + sffile;
+                }
                 else name[0]=toupper(name[0]);
             }
             extern std::string getoplmode(), getoplemu();
-            std::string midiinfo = "MIDI available: "+std::string(midi.available?"Yes":"No")+"\nMIDI device: "+name+"\nMIDI soundfont file / ROM path:\n"+sffile+"\nOPL mode: "+getoplmode()+"\nOPL emulation: "+getoplemu();
+            std::string midiinfo = "MIDI available: "+std::string(midi.available?"Yes":"No")+"\nMIDI device: "+name+sf_rom
+                +"\nOPL mode: "+getoplmode()+"\nOPL emulation: "+getoplemu()
+                + (sf_rom.size()?"":"\n\n\n");
             std::istringstream in(midiinfo.c_str());
             int r=0;
             if (in)	for (std::string line; std::getline(in, line); ) {
@@ -2636,6 +2674,7 @@ public:
                         readonly=true;
                     else {
                         readonly=Drives[statusdrive]->readonly;
+#if !defined(OSFREE)
                         if (!path.size()) {
                             fatDrive *fdp = dynamic_cast<fatDrive*>(Drives[statusdrive]);
                             if (fdp!=NULL&&fdp->opts.mounttype==1)
@@ -2643,9 +2682,11 @@ public:
                             else if (fdp!=NULL&&fdp->opts.mounttype==2)
                                 path="RAM drive";
                         }
+#endif
                     }
                     swappos=DriveManager::GetDrivePosition(statusdrive);
                 } else if (!strncmp(info, "PhysFS directory ", 17)) {
+#if !defined(OSFREE)
                     type="PhysFS directory";
                     path=info+17;
                     readonly=true;
@@ -2657,10 +2698,17 @@ public:
                             overlay=std::string(wdir)+(wdir[strlen(wdir)-1]!=CROSS_FILESPLIT?std::string(1, CROSS_FILESPLIT):"")+std::string(1, 'A'+statusdrive)+"_DRIVE";
                         }
                     }
+#else
+                    E_Exit("Physfs directory not supported");
+#endif
                 } else if (!strncmp(info, "PhysFS CDRom ", 13)) {
+#if !defined(OSFREE)
                     type="PhysFS CDRom";
                     path=info+13;
                     readonly=true;
+#else
+                    E_Exit("Physfs CDROM not supported");
+#endif
                 } else if (!strncmp(info, "local directory ", 16)) {
                     type="local directory";
                     path=info+16;
@@ -3113,7 +3161,7 @@ protected:
     GUI::Input *name;
 public:
     ShowHelpAbout(GUI::Screen *parent, int x, int y, const char *title) :
-        ToplevelWindow(parent, x, y, 420, 230, title) {
+        ToplevelWindow(parent, x, y, 480, 230, title) {
             std::istringstream in(aboutmsg);
             int r=0;
             if (in)	for (std::string line; std::getline(in, line); ) {
@@ -3460,6 +3508,64 @@ public:
             std::string url = "https://dosbox-x.com/";
 #if defined(WIN32)
             ShellExecute(NULL, "open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
+#elif defined(OS2)
+            char str[CCHMAXPATH];
+            APIRET rc;
+            char path[CCHMAXPATH], params[100], parambuffer[500], *paramptr;
+            char userPath[CCHMAXPATH], sysPath[CCHMAXPATH];
+            PRFPROFILE profile = { sizeof(userPath), (PSZ)userPath, sizeof(sysPath), (PSZ)sysPath };
+            HINI os2Ini;
+            HAB hAnchor = WinQueryAnchorBlock(WinQueryActiveWindow(HWND_DESKTOP));
+            RESULTCODES result = { 0 };
+            PROGDETAILS details;
+
+            // Initialize buffers
+            memset(path, 0, sizeof(path));
+            memset(parambuffer, 0, sizeof(parambuffer));
+            memset(params, 0, sizeof(params));
+            
+            // We have to look in the OS/2 configuration for the default browser.
+            // First step: Find the configuration files
+            if (!PrfQueryProfile(hAnchor, &profile)) {
+                systemmessagebox(url.c_str(), "Could not query application handle", "ok", "error", 0);
+                return;
+            }
+            
+            // Second step: Open the configuration files and read exe path and parameters
+            os2Ini = PrfOpenProfile(hAnchor, (PCSZ)userPath);
+            if (os2Ini == NULLHANDLE) {
+                systemmessagebox(url.c_str(), "Could not open user profile", "ok", "error", 0);
+                return;
+            }
+            if (!PrfQueryProfileString(os2Ini, (PCSZ)"WPURLDEFAULTSETTINGS", (PCSZ)"DefaultBrowserExe", NULL, path, sizeof(path))) {
+                PrfCloseProfile(os2Ini);
+                systemmessagebox(url.c_str(), "Could not find URL settings", "ok", "error", 0);
+                return;
+            }
+
+            PrfQueryProfileString(os2Ini, (PCSZ)"WPURLDEFAULTSETTINGS", (PCSZ)"DefaultBrowserParameters", NULL, params, sizeof(params));
+            PrfCloseProfile(os2Ini);
+            
+            // concat arguments
+            if (strlen(params) > 0) 
+                strncat(params, " ", 20);
+            strncat(params, url.c_str(), url.length());
+            
+            // Build parameter buffer
+            strcpy(parambuffer, "Browser");
+            paramptr = &parambuffer[strlen(parambuffer)+1];
+            // copy params to buffer
+            strcpy(paramptr, params);
+            paramptr += strlen(params) + 1;
+            // To be sure: Terminate parameter list with NULL
+            *paramptr = '\0';
+
+            // Last step: Execute detached browser
+            rc = DosExecPgm(userPath, sizeof(userPath), EXEC_ASYNC, (PSZ)parambuffer, NULL, &result, (PSZ)path);
+            if (rc != NO_ERROR) {
+                systemmessagebox(url.c_str(), "Could not open browser", "ok", "error", 0);
+                return;
+            }
 #elif defined(LINUX)
             system(("xdg-open "+url).c_str());
 #elif defined(MACOSX)
@@ -3865,7 +3971,16 @@ void RunCfgTool(Bitu val) {
 #if C_OPENGL
         voodoo_ogl_update_dimensions();
 #endif
-    }
+    }    
+#if defined(MACOSX) && defined(C_SDL2) && C_METAL
+    if(sdl.desktop.want_type == SCREEN_METAL){
+        OUTPUT_Metal_Shutdown();
+#if defined(C_OPENGL)
+        change_output(3);
+#endif
+        change_output(14);
+    }  
+#endif
 }
 
 void GUI_Shortcut(int select) {

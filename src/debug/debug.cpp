@@ -161,7 +161,9 @@ static void LogGDT(void);
 static void LogLDT(void);
 static void LogIDT(void);
 static void LogXMS(void);
+#if !defined(OSFREE)
 static void LogEMS(void);
+#endif
 static void LogFNKEY(void);
 static void LogPages(char* selname);
 static void LogCPUInfo(void);
@@ -186,6 +188,8 @@ void DEBUG_EndPagedContent(void);
 Bitu MEM_PageMaskActive(void);
 Bitu MEM_TotalPages(void);
 Bitu MEM_PageMask(void);
+void DEBUG_WarnDynamic(void);
+int CPU_IsDynamicCore(void); // cpu.cpp 0=normal, 1=dynamic, 2=dynamic core with assembler
 
 static void LogEMUMachine(void) {
     DEBUG_BeginPagedContent();
@@ -218,6 +222,7 @@ static void LogEMUMachine(void) {
             case SVGA_TsengET3K:        cardName ="Tseng ET3000";    break;
             case SVGA_ParadisePVGA1A:   cardName ="Paradise PVGA1A"; break;
             case SVGA_ATI:              cardName ="ATI";             break;
+            case SVGA_DOSBoxIG:         cardName ="DOSBox Integrated Graphics"; break;
         }
 
         DEBUG_ShowMsg("Machine: %s %s",m, cardName);
@@ -279,6 +284,21 @@ public:
 };
 #endif
 
+typedef struct MEMFinder {
+	bool usePreviousValue = false;
+	uint8_t opType = 0;
+	uint8_t size = 1;
+	uint16_t iterations = 0;
+	uint16_t seg = 0;
+	uint32_t ofs = 0;
+	uint32_t range = 0;
+	uint32_t value = 0;
+	uint32_t matches = 0;
+	vector<uint8_t> tableValue;
+	vector<bool> tableTruth;
+}MEMFinder;
+
+MEMFinder* MEMFINDInstance = NULL;
 
 class DEBUG;
 
@@ -313,6 +333,8 @@ static bool debug_running = false;
 static bool check_rescroll = false;
 
 static FPU_rec oldfpu;
+static bool warn_dynamic = false;
+
 
 void VGA_DebugRedraw(void);
 
@@ -1872,6 +1894,11 @@ bool lookslikefloat(char* str) {
     return true;
 }
 
+void AddBPINT3(void) {
+	CBreakpoint::AddIntBreakpoint(3,BPINT_ALL,BPINT_ALL,false);
+	CBreakpoint::ActivateBreakpoints();
+}
+
 void VGA_DumpFontRamBIN(const char *filename);
 void VGA_DumpFontRamBMP(const char *filename);
 int32_t DEBUG_Run(int32_t amount,bool quickexit);
@@ -1970,9 +1997,286 @@ bool ParseCommand(char* str) {
 		return true;
 	}
 
+    if (command == "MEMFIND") { // Start a memory search instance with seg:ofs range
+		uint32_t valfind;
+		uint8_t valfind8;
+		uint16_t valfind16;
+		uint32_t valfind32;
+		uint32_t listedvalues = 0;
+		if (found[0] == '!'){
+			if (MEMFINDInstance != NULL){
+				DEBUG_ShowMsg("DEBUG: Memory search instance cancelled.");
+				MEMFINDInstance->tableTruth.clear();
+				MEMFINDInstance->tableValue.clear();
+				MEMFINDInstance->tableTruth.shrink_to_fit();
+				MEMFINDInstance->tableValue.shrink_to_fit();
+				delete MEMFINDInstance;
+				MEMFINDInstance = NULL;
+			} else {
+				DEBUG_ShowMsg("DEBUG: No active search instances to cancel.");
+			}
+			return true;
+		} else if (found[0] == 'L'){
+			if (MEMFINDInstance != NULL){
+				DEBUG_BeginPagedContent();
+				uint32_t j = 0;
+				for (uint32_t i = (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16)); i < (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16) + MEMFINDInstance->range); i+=MEMFINDInstance->size){
+							switch (MEMFINDInstance->size){
+								case 1:
+									mem_readb_checked((PhysPt)(i),&valfind8);
+									valfind = valfind8;
+									break;
+								case 2:
+									mem_readw_checked((PhysPt)(i),&valfind16);
+									valfind = valfind16;
+									break;
+								case 4:
+									mem_readd_checked((PhysPt)(i),&valfind32);
+									valfind = valfind32;
+									break;
+								default:
+									mem_readb_checked((PhysPt)(i),&valfind8);
+									valfind = valfind8;
+									break;
+							}
+							if (MEMFINDInstance->tableTruth[j] == true){
+								listedvalues++;
+								DEBUG_ShowMsg("DEBUG: [MEMFIND] Address: %04X:%06X Current Value: %08X\n",MEMFINDInstance->seg,(i - (MEMFINDInstance->seg * 16)),valfind);
+							}
+							j+=MEMFINDInstance->size;
+						}
+				DEBUG_ShowMsg("DEBUG: [MEMFIND] Matched values during current instance: %06X\n",listedvalues);
+				DEBUG_EndPagedContent();
+			} else {
+				DEBUG_ShowMsg("DEBUG: No active search instances to list from.");
+			}
+			return true;
+		}
+		uint16_t seg = (uint16_t)GetHexValue(found,found); found++;
+		uint32_t ofs = GetHexValue(found,found); found++;
+		uint32_t num = GetHexValue(found,found); found++;
+		if ((MEMFINDInstance == NULL) && (num > 0)){
+			if (((seg*16)+ofs+num) > 16777215){
+				DEBUG_ShowMsg("DEBUG: Address range larger than valid size, cancelling.");
+				return true;
+			}
+			DEBUG_ShowMsg("DEBUG: Created memory search instance.");
+			MEMFINDInstance = new MEMFinder;
+		} else if ((MEMFINDInstance == NULL) && (num == 0)){
+			DEBUG_ShowMsg("DEBUG: --MEMFIND-- Start memory search instance.");
+			DEBUG_ShowMsg("DEBUG: Use MEMS to proceed through search instance.");
+			DEBUG_ShowMsg("DEBUG: Usage: MEMFIND (!/L) [seg]:[offset] [range] (B/W/D)");
+			DEBUG_ShowMsg("DEBUG: L - List entries matched in the search instance.");
+			DEBUG_ShowMsg("DEBUG: ! - Cancel memory search instance.");
+			return true;
+		} else if (MEMFINDInstance != NULL){
+			DEBUG_ShowMsg("DEBUG: Memory search instance is already active.");
+			return true;
+		}
+		switch (*found){
+			case 'B':
+				DEBUG_ShowMsg("DEBUG: 1 byte specified.");
+				MEMFINDInstance->size = 1;
+				break;
+			case 'W':
+				DEBUG_ShowMsg("DEBUG: 2 bytes specified.");
+				MEMFINDInstance->size = 2;
+				break;
+			case 'D':
+				DEBUG_ShowMsg("DEBUG: 4 bytes specified.");
+				MEMFINDInstance->size = 4;
+				break;
+			default:
+				DEBUG_ShowMsg("DEBUG: No size specified, using 1 byte.");
+				MEMFINDInstance->size = 1;
+				break;
+		}
+		DEBUG_ShowMsg("DEBUG: RAM search from %04X:%04X with range: %06X\n",seg,ofs,num);
+		MEMFINDInstance->range = num;
+		MEMFINDInstance->ofs = ofs;
+		MEMFINDInstance->seg = seg;
+		MEMFINDInstance->tableTruth.resize(num,true);
+		for (uint32_t i = (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16)); i < (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16) + MEMFINDInstance->range); i++){
+			mem_readb_checked((PhysPt)(i),&valfind8);
+			MEMFINDInstance->tableValue.push_back(valfind8);
+		}
+		return true;
+	}
+
+	if (command == "MEMS") { // Search through MEMFIND for matching values in memory search instance
+		bool parsed;
+		uint32_t valfind;
+		uint8_t valfind8;
+		uint16_t valfind16;
+		uint32_t valfind32;
+		uint32_t value;
+		uint32_t matches = 0;
+		char opTypeStr[26];
+		if (MEMFINDInstance == NULL){
+			DEBUG_ShowMsg("DEBUG: MEMFIND Memory search is not active.\n");
+			return true;
+		}
+		switch (found[0]){
+			case '>':
+				if (found[1] == '='){
+					found+=2;
+					MEMFINDInstance->opType = 4;
+					sprintf(opTypeStr, "GREATER THAN OR EQUAL TO");
+				} else {
+					found+=1;
+					MEMFINDInstance->opType = 1;
+					sprintf(opTypeStr, "GREATER THAN");
+				}
+				break;
+			case '<':
+				if (found[1] == '='){
+					found+=2;
+					MEMFINDInstance->opType = 5;
+					sprintf(opTypeStr, "LESS THAN OR EQUAL TO");
+				} else {
+					found+=1;
+					MEMFINDInstance->opType = 2;
+					sprintf(opTypeStr, "LESS THAN");
+				}
+				break;
+			case '!':
+				found+=1;
+				MEMFINDInstance->opType = 3;
+				sprintf(opTypeStr, "NOT EQUAL TO");
+				break;
+			case '=':
+				found+=1;
+				MEMFINDInstance->opType = 0;
+				sprintf(opTypeStr, "EQUAL TO");
+			default:
+				MEMFINDInstance->opType = 0;
+				sprintf(opTypeStr, "EQUAL TO");
+				break;
+		}
+		SkipSpace(found);
+		if (*found == ' '){
+			DEBUG_ShowMsg("DEBUG: MEMS - Memory Search from MEMFIND instance.\n");
+			DEBUG_ShowMsg("DEBUG: Usage: MEMS (OPERATOR) VALUE.\n");
+			DEBUG_ShowMsg("DEBUG: Valid operators: >, >=, <, <=, !, =.\n");
+			return true;
+		} else if (*found == '\0'){
+			DEBUG_ShowMsg("DEBUG: No value was entered. Comparing with previous values.\n");
+			MEMFINDInstance->usePreviousValue = true;
+			value = 0;
+		} else {
+			value = GetHexValue(found,found,&parsed);
+			if (((value > 255) && (MEMFINDInstance->size == 1)) || ((value > 65535) && (MEMFINDInstance->size == 2))){
+				DEBUG_ShowMsg("DEBUG: Memory search failed. Value is larger than specified size range.\n");
+				return true;
+			}
+			MEMFINDInstance->value = value;
+			MEMFINDInstance->usePreviousValue = false;
+		}
+		uint32_t y = 0;	//This index is seperated from the for loop, as the for loop can start from any index while this particular index starts at 0
+		for (uint32_t i = (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16)); i < (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16) + MEMFINDInstance->range); i+=MEMFINDInstance->size){
+			switch (MEMFINDInstance->size){
+				case 1:
+					mem_readb_checked((PhysPt)(i),&valfind8);
+					valfind = valfind8;
+					if (MEMFINDInstance->usePreviousValue == true){
+						memcpy(&value, &MEMFINDInstance->tableValue[y], 1);
+					}
+					break;
+				case 2:
+					mem_readw_checked((PhysPt)(i),&valfind16);
+					valfind = valfind16;
+					if (MEMFINDInstance->usePreviousValue == true){
+						memcpy(&value, &MEMFINDInstance->tableValue[y], 2);
+					}
+					break;
+				case 4:
+					mem_readd_checked((PhysPt)(i),&valfind32);
+					valfind = valfind32;
+					if (MEMFINDInstance->usePreviousValue == true){
+						memcpy(&value, &MEMFINDInstance->tableValue[y], 4);
+					}
+					break;
+				default:
+					mem_readb_checked((PhysPt)(i),&valfind8);
+					valfind = valfind8;
+					if (MEMFINDInstance->usePreviousValue == true){
+						memcpy(&value, &MEMFINDInstance->tableValue[y], 1);
+					}
+					break;
+			}
+			switch (MEMFINDInstance->opType){
+				case 1:
+					if ((valfind > value) && (MEMFINDInstance->tableTruth[y] == true)){
+						matches++;
+					} else {
+						MEMFINDInstance->tableTruth[y] = false;
+					}
+					break;
+				case 2:
+					if ((valfind < value) && (MEMFINDInstance->tableTruth[y] == true)){
+						matches++;
+					} else {
+						MEMFINDInstance->tableTruth[y] = false;
+					}
+					break;
+				case 3:
+					if ((valfind != value) && (MEMFINDInstance->tableTruth[y] == true)){
+						matches++;
+					} else {
+						MEMFINDInstance->tableTruth[y] = false;
+					}
+					break;
+				case 4:
+					if ((valfind >= value) && (MEMFINDInstance->tableTruth[y] == true)){
+						matches++;
+					} else {
+						MEMFINDInstance->tableTruth[y] = false;
+					}
+					break;
+				case 5:
+					if ((valfind <= value) && (MEMFINDInstance->tableTruth[y] == true)){
+						matches++;
+					} else {
+						MEMFINDInstance->tableTruth[y] = false;
+					}
+					break;
+				default:
+					if ((valfind == value) && (MEMFINDInstance->tableTruth[y] == true)){
+						matches++;
+					} else {
+						MEMFINDInstance->tableTruth[y] = false;
+					}
+					break;
+			}
+			y+=MEMFINDInstance->size;
+		}
+		MEMFINDInstance->matches = matches;
+		MEMFINDInstance->iterations++;
+		if (MEMFINDInstance->matches == 0){
+			if (MEMFINDInstance->usePreviousValue == true){
+				DEBUG_ShowMsg("DEBUG: No more matches found when comparing %s previous value. Memory search instance finished.\n",opTypeStr);
+			} else {
+				DEBUG_ShowMsg("DEBUG: No more matches found with value %s (%06X). Memory search instance finished.\n",opTypeStr,value);
+			}
+			MEMFINDInstance->tableTruth.clear();
+			MEMFINDInstance->tableValue.clear();
+			MEMFINDInstance->tableTruth.shrink_to_fit();
+			MEMFINDInstance->tableValue.shrink_to_fit();
+			delete MEMFINDInstance;
+			MEMFINDInstance = NULL;
+		} else {
+				if (MEMFINDInstance->usePreviousValue == true){
+					DEBUG_ShowMsg("DEBUG: (%06X) addresses matching %s their previous values. Iterations: %06X\n",MEMFINDInstance->matches,opTypeStr,MEMFINDInstance->iterations);
+				} else {
+					DEBUG_ShowMsg("DEBUG: (%06X) matches found with value %s (%06X). Iterations: %06X\n",MEMFINDInstance->matches,opTypeStr,value,MEMFINDInstance->iterations);
+				}
+		}
+		return true;
+	}
+
 	if (command == "IV") { // Insert variable
 		uint16_t seg = (uint16_t)GetHexValue(found,found); found++;
-		uint32_t ofs = (uint16_t)GetHexValue(found,found); found++;
+		uint32_t ofs = GetHexValue(found,found); found++;
 		char name[16];
 		for (int i=0; i<16; i++) {
 			if (found[i] && (found[i]!=' ')) name[i] = found[i];
@@ -2532,7 +2836,9 @@ bool ParseCommand(char* str) {
 		if (command == "MCBS") LogMCBS();
         else if (command == "KERN") LogDOSKernMem();
         else if (command == "XMS") LogXMS();
+#if !defined(OSFREE)
         else if (command == "EMS") LogEMS();
+#endif
         else if (command == "FNKEY") LogFNKEY();
         else return false;
 
@@ -3692,6 +3998,8 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("EMU MEM/MACHINE           - Show emulator memory or machine info.\n");
 		DEBUG_ShowMsg("MEMDUMP [seg]:[off] [len] - Write memory to file memdump.txt.\n");
 		DEBUG_ShowMsg("MEMDUMPBIN [s]:[o] [len]  - Write memory to file memdump.bin.\n");
+        DEBUG_ShowMsg("MEMFIND [seg]:[off] [.].. - Start memory find search instance.\n");
+		DEBUG_ShowMsg("MEMS [operator] [value]   - Search value within instance.\n");
 		DEBUG_ShowMsg("SELINFO [segName]         - Show selector info.\n");
 
 		DEBUG_ShowMsg("INTVEC [filename]         - Writes interrupt vector table to file.\n");
@@ -4306,7 +4614,12 @@ uint32_t DEBUG_CheckKeys(void) {
 				break;
 		case KEY_F(10):	// Step over inst
 				DrawRegistersUpdateOld();
-				if (StepOver()) {
+                if(!CPU_IsDynamicCore()) warn_dynamic = false;
+                else if(!warn_dynamic) {
+                    DEBUG_WarnDynamic();
+                    warn_dynamic = true;
+                }
+                if (StepOver()) {
 					mustCompleteInstruction = true;
 					inhibit_int_breakpoint = true;
 					ret = DEBUG_Run(1,false);
@@ -4319,6 +4632,11 @@ uint32_t DEBUG_CheckKeys(void) {
 				/* FALLTHROUGH */
 		case KEY_F(11):	// trace into
 				DrawRegistersUpdateOld();
+                if(!CPU_IsDynamicCore()) warn_dynamic = false;
+                else if(!warn_dynamic) {
+                    DEBUG_WarnDynamic();
+                    warn_dynamic = true;
+                }
 				exitLoop = false;
 				mustCompleteInstruction = true;
 				ret = DEBUG_Run(1,true);
@@ -4511,6 +4829,11 @@ Bitu DEBUG_Loop(void) {
 
 void DEBUG_FlushInput(void);
 
+void DEBUG_WarnDynamic(void) {
+    DEBUG_ShowMsg("Warning: Single-stepping may not work correctly with \"Dynamic core\".");
+    DEBUG_ShowMsg("         If you encounter problems, switch the CPU core to \"Normal core\".");
+}
+
 bool tohide=true;
 static bool hidedebugger=false;
 void DEBUG_Enable_Handler(bool pressed) {
@@ -4602,8 +4925,13 @@ void DEBUG_Enable_Handler(bool pressed) {
 	DEBUG_DrawScreen();
 	DOSBOX_SetLoop(&DEBUG_Loop);
 	mainMenu.get_item("mapper_debugger").check(true).refresh_item(mainMenu);
-	if (!showhelp) {
-		showhelp=true;
+    if(!CPU_IsDynamicCore()) warn_dynamic = false;
+    else if(!warn_dynamic) {
+        DEBUG_WarnDynamic();
+        warn_dynamic = true;
+    }
+    if (!showhelp) {
+        showhelp=true;
 		DEBUG_ShowMsg("***| TYPE HELP (+ENTER) TO GET AN OVERVIEW OF ALL COMMANDS |***\n");
 	}
 	//KEYBOARD_ClrBuffer();
@@ -4655,23 +4983,25 @@ static void LogMCBChain(uint16_t mcb_segment) {
 				psp_seg_note = "";
 		}
 
-        DEBUG_ShowMsg("   %04X  %12u     %04X %-7s  %s",mcb_segment,mcb.GetSize() << 4,mcb.GetPSPSeg(), psp_seg_note, filename);
+		DEBUG_ShowMsg("   %04X  %12u     %04X %-7s  %s",mcb_segment,mcb.GetSize() << 4,mcb.GetPSPSeg(), psp_seg_note, filename);
 
 		// print a message if dataAddr is within this MCB's memory range
 		PhysPt mcbStartAddr = PhysMake(mcb_segment+1,0);
 		PhysPt mcbEndAddr = PhysMake(mcb_segment+1+mcb.GetSize(),0);
 		if (dataAddr >= mcbStartAddr && dataAddr < mcbEndAddr) {
-            DEBUG_ShowMsg("   (data addr %04hX:%04X is %u bytes past this MCB)",dataSeg,DOS_dataOfs,dataAddr - mcbStartAddr);
+			DEBUG_ShowMsg("   (data addr %04hX:%04X is %u bytes past this MCB)",dataSeg,DOS_dataOfs,dataAddr - mcbStartAddr);
 		}
 
 		// if we've just processed the last MCB in the chain, break out of the loop
-		if (mcb.GetType()==0x5a) {
-			break;
-		}
-		// else, move to the next MCB in the chain
 		mcb_segment+=mcb.GetSize()+1;
+		if (mcb.GetType()==0x5a)
+			break;
+
+		// else, move to the next MCB in the chain
 		mcb.SetPt(mcb_segment);
 	}
+
+	DEBUG_ShowMsg("   %04X  END OF CHAIN",mcb_segment);
 }
 
 #include "regionalloctracking.h"
@@ -4701,10 +5031,12 @@ static void LogBIOSMem(void) {
 Bitu XMS_GetTotalHandles(void);
 bool XMS_GetHandleInfo(Bitu &phys_location,Bitu &size,Bitu &lockcount,bool &free,Bitu handle);
 
+#if !defined(OSFREE)
 bool EMS_GetHandle(Bitu &size,PhysPt &addr,std::string &name,Bitu handle);
 const char *EMS_Type_String(void);
 Bitu EMS_Max_Handles(void);
 bool EMS_Active(void);
+#endif
 
 static void LogFNKEY(void) {
     DEBUG_BeginPagedContent();
@@ -4715,6 +5047,7 @@ static void LogFNKEY(void) {
     DEBUG_EndPagedContent();
 }
 
+#if !defined(OSFREE)
 static void LogEMS(void) {
     Bitu h_size;
     PhysPt xh_addr;
@@ -4785,6 +5118,7 @@ static void LogEMS(void) {
 
     DEBUG_EndPagedContent();
 }
+#endif
 
 static void LogXMS(void) {
     Bitu phys_location;
@@ -5096,20 +5430,20 @@ static void LogInstruction(uint16_t segValue, uint32_t eipValue,  ofstream& out)
 	char dline[200];Bitu size;
 	size = DasmI386(dline, start, reg_eip, cpu.code.big);
 	char* res = empty;
-	if (showExtend && (cpuLogType > 0) ) {
+	if (showExtend && (cpuLogType > 0)) {
 		res = AnalyzeInstruction(dline,false);
 		if (!res || !(*res)) res = empty;
 		Bitu reslen = strlen(res);
-        if (reslen < 22) {
-            memset(res + reslen, ' ', 22 - reslen);
-            res[22] = 0;
-        }
+		if (reslen < 22) {
+			memset(res + reslen, ' ', 22 - reslen);
+			res[22] = 0;
+		}
 	}
 	Bitu len = strlen(dline);
-    if (len < 30) {
-        memset(dline + len, ' ', 30 - len);
-        dline[30] = 0;
-    }
+	if (len < 30) {
+		memset(dline + len, ' ', 30 - len);
+		dline[30] = 0;
+	}
 
 	// Get register values
 
@@ -5118,7 +5452,9 @@ static void LogInstruction(uint16_t segValue, uint32_t eipValue,  ofstream& out)
 	} else if (cpuLogType == 1) {
 		out << setw(4) << SegValue(cs) << ":" << setw(8) << reg_eip << "  " << dline << "  " << res;
 	} else if (cpuLogType == 2) {
-		char ibytes[200]="";	char tmpc[200];
+		char ibytes[200]="";
+		char tstamp[128];
+		char tmpc[200];
 		for (Bitu i=0; i<size; i++) {
 			uint8_t value;
 			if (mem_readb_checked((PhysPt)(start+i),&value)) sprintf(tmpc,"%s","?? ");
@@ -5126,32 +5462,33 @@ static void LogInstruction(uint16_t segValue, uint32_t eipValue,  ofstream& out)
 			strcat(ibytes,tmpc);
 		}
 		len = strlen(ibytes);
-        if (len < 21) {
-            for (Bitu i = 0; i < 21 - len; i++) ibytes[len + i] = ' ';
-            ibytes[21] = 0;
-        }
-		out << setw(4) << SegValue(cs) << ":" << setw(8) << reg_eip << "  " << dline << "  " << res << "  " << ibytes;
+		if (len < 21) {
+			for (Bitu i = 0; i < 21 - len; i++) ibytes[len + i] = ' ';
+			ibytes[21] = 0;
+		}
+		sprintf(tstamp,"%.6f",(double)PIC_FullIndex());
+		out << tstamp << " " << setw(4) << SegValue(cs) << ":" << setw(8) << reg_eip << "  " << dline << "  " << res << "  " << ibytes;
 	}
 
 	out << " EAX:" << setw(8) << reg_eax << " EBX:" << setw(8) << reg_ebx
-	    << " ECX:" << setw(8) << reg_ecx << " EDX:" << setw(8) << reg_edx
-	    << " ESI:" << setw(8) << reg_esi << " EDI:" << setw(8) << reg_edi
-	    << " EBP:" << setw(8) << reg_ebp << " ESP:" << setw(8) << reg_esp
-	    << " DS:"  << setw(4) << SegValue(ds)<< " ES:"  << setw(4) << SegValue(es);
+		<< " ECX:" << setw(8) << reg_ecx << " EDX:" << setw(8) << reg_edx
+		<< " ESI:" << setw(8) << reg_esi << " EDI:" << setw(8) << reg_edi
+		<< " EBP:" << setw(8) << reg_ebp << " ESP:" << setw(8) << reg_esp
+		<< " DS:"  << setw(4) << SegValue(ds)<< " ES:"  << setw(4) << SegValue(es);
 
 	if(cpuLogType == 0) {
 		out << " SS:"  << setw(4) << SegValue(ss) << " C"  << (get_CF()>0)  << " Z"   << (get_ZF()>0)
-		    << " S" << (get_SF()>0) << " O"  << (get_OF()>0) << " I"  << GETFLAGBOOL(IF);
+			<< " S" << (get_SF()>0) << " O"  << (get_OF()>0) << " I"  << GETFLAGBOOL(IF);
 	} else {
 		out << " FS:"  << setw(4) << SegValue(fs) << " GS:"  << setw(4) << SegValue(gs)
-		    << " SS:"  << setw(4) << SegValue(ss)
-		    << " CF:"  << (get_CF()>0)  << " ZF:"   << (get_ZF()>0)  << " SF:"  << (get_SF()>0)
-		    << " OF:"  << (get_OF()>0)  << " AF:"   << (get_AF()>0)  << " PF:"  << (get_PF()>0)
-		    << " IF:"  << GETFLAGBOOL(IF);
+			<< " SS:"  << setw(4) << SegValue(ss)
+			<< " CF:"  << (get_CF()>0)  << " ZF:"   << (get_ZF()>0)  << " SF:"  << (get_SF()>0)
+			<< " OF:"  << (get_OF()>0)  << " AF:"   << (get_AF()>0)  << " PF:"  << (get_PF()>0)
+			<< " IF:"  << GETFLAGBOOL(IF);
 	}
 	if(cpuLogType == 2) {
 		out << " TF:" << GETFLAGBOOL(TF) << " VM:" << GETFLAGBOOL(VM) <<" FLG:" << setw(8) << reg_flags
-		    << " CR0:" << setw(8) << cpu.cr0;
+			<< " CR0:" << setw(8) << cpu.cr0;
 	}
 	out << endl;
 }
@@ -5213,18 +5550,22 @@ private:
 };
 #endif
 
-#if C_DEBUG
+#if !defined(OSFREE)
+# if C_DEBUG
 extern bool debugger_break_on_exec;
+# endif
 #endif
 
 void DEBUG_CheckExecuteBreakpoint(uint16_t seg, uint32_t off)
 {
-#if C_DEBUG
+#if !defined(OSFREE)
+# if C_DEBUG
     if (debugger_break_on_exec) {
 		CBreakpoint::AddBreakpoint(seg,off,true);
 		CBreakpoint::ActivateBreakpointsExceptAt(SegPhys(cs)+reg_eip);
         debugger_break_on_exec = false;
     }
+# endif
 #endif
 #if 0
 	if (pDebugcom && pDebugcom->IsActive()) {

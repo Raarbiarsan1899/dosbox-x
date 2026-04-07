@@ -213,7 +213,7 @@ Bitu OUTPUT_TTF_SetSize() {
         GFX_SetResizeable(false);
         sdl.window = GFX_SetSDLSurfaceWindow(sdl.draw.width + sdl.clip.x, sdl.draw.height + sdl.clip.y);
         sdl.surface = sdl.window?SDL_GetWindowSurface(sdl.window):NULL;
-        if (firstsize && (posx < 0 || posy < 0) && !(posx == -2 && posy == -2) && text) {
+        if (/* firstsize && */ (posx < 0 || posy < 0) && !(posx == -2 && posy == -2) && text) {
             firstsize=false;
             if (sdl.displayNumber==0) SDL_SetWindowPosition(sdl.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
             else SDL_SetWindowPosition(sdl.window, bx, by);
@@ -339,7 +339,7 @@ bool readTTF(const char *fName, bool bold, bool ital) {
     }
     if (!ttf_fh) {
         std::string config_path;
-        Cross::GetPlatformConfigDir(config_path);
+        config_path = Cross::GetPlatformConfigDir();
         struct stat info;
         if (!stat(config_path.c_str(), &info) && (info.st_mode & S_IFDIR)) {
             strcpy(ttfPath, config_path.c_str());
@@ -355,7 +355,7 @@ bool readTTF(const char *fName, bool bold, bool ital) {
     }
     if (!ttf_fh) {
         std::string res_path;
-        Cross::GetPlatformResDir(res_path);
+        res_path = Cross::GetPlatformResDir();
         struct stat info;
         if (!stat(res_path.c_str(), &info) && (info.st_mode & S_IFDIR)) {
             strcpy(ttfPath, res_path.c_str());
@@ -548,8 +548,10 @@ int setTTFCodePage() {
     if (cp) {
         LOG_MSG("Loaded system codepage: %d\n", cp);
         int notMapped = setTTFMap(true);
+#if !defined(OSFREE)
         if (strcmp(RunningProgram, "LOADLIN") && !dos_kernel_disabled)
             initcodepagefont();
+#endif
 #if defined(WIN32) && !defined(HX_DOS)
         DOSBox_SetSysMenu();
 #endif
@@ -1431,7 +1433,7 @@ void ttf_switch_on(bool ss=true) {
         bool OpenGL_using(void), gl = OpenGL_using();
 	(void)gl; // unused var warning
 #if defined(WIN32) && !defined(C_SDL2)
-        //change_output(0); // call OUTPUT_SURFACE_Select() to initialize output before enabling TTF output on Windows builds
+        change_output(0); // call OUTPUT_SURFACE_Select() to initialize output before enabling TTF output on Windows builds
 #endif
         change_output(10); // call OUTPUT_TTF_Select()
         SetVal("sdl", "output", "ttf");

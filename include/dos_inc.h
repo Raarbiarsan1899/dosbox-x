@@ -82,6 +82,7 @@ struct CommandTail{
 
 extern bool dos_kernel_disabled;
 
+#if !defined(OSFREE)
 #define IS_DOS_JAPANESE (!dos_kernel_disabled && mem_readb(Real2Phys(dos.tables.dbcs) + 0x02) == 0x81 && mem_readb(Real2Phys(dos.tables.dbcs) + 0x03) == 0x9F)
 #define IS_DOS_CJK (!dos_kernel_disabled && ((mem_readb(Real2Phys(dos.tables.dbcs) + 0x02) == 0x81 || mem_readb(Real2Phys(dos.tables.dbcs) + 0x02) == 0xA1) && (mem_readb(Real2Phys(dos.tables.dbcs) + 0x03) == 0x9F || mem_readb(Real2Phys(dos.tables.dbcs) + 0x03) == 0xFE)))
 #define IS_DOSV (dos.set_jdosv_enabled || dos.set_kdosv_enabled || dos.set_pdosv_enabled || dos.set_tdosv_enabled)
@@ -90,6 +91,17 @@ extern bool dos_kernel_disabled;
 #define IS_PDOSV (dos.set_pdosv_enabled)
 #define IS_TDOSV (dos.set_tdosv_enabled)
 #define IS_J3100 (dos.set_j3100_enabled)
+#else
+/* OSFREE: You don't get any of this! */
+#define IS_DOS_JAPANESE (0)
+#define IS_DOS_CJK (0)
+#define IS_DOSV (0)
+#define IS_JDOSV (0)
+#define IS_KDOSV (0)
+#define IS_PDOSV (0)
+#define IS_TDOSV (0)
+#define IS_J3100 (0)
+#endif
 
 #define	EXT_DEVICE_BIT				0x0200
 
@@ -281,7 +293,7 @@ bool DOS_CreateTempFile(char * const name,uint16_t * entry);
 bool DOS_FileExists(char const * const name);
 
 /* Helper Functions */
-bool DOS_MakeName(char const * const name,char * const fullname,uint8_t * drive,bool isVolume = false);
+bool DOS_MakeName(char const * const name,char * const fullname,uint8_t * drive);
 /* Drive Handing Routines */
 uint8_t DOS_GetDefaultDrive(void);
 void DOS_SetDefaultDrive(uint8_t drive);
@@ -367,7 +379,8 @@ enum {
 	KEYB_FILENOTFOUND,
 	KEYB_INVALIDFILE,
 	KEYB_LAYOUTNOTFOUND,
-	KEYB_INVALIDCPFILE
+	KEYB_INVALIDCPFILE,
+	KEYB_LOADERROR
 };
 
 
@@ -657,7 +670,7 @@ public:
 
     int GetFindData(int fmt,char * finddata,int *c);
 	
-	void SetupSearch(uint8_t _sdrive,uint8_t _sattr,char * pattern);
+	void SetupSearch(uint8_t _sdrive,uint8_t _sattr,const char * pattern);
 	void SetResult(const char * _name,const char * _lname,uint32_t _size,uint32_t _hsize,uint16_t _date,uint16_t _time,uint8_t _attr);
 	
 	uint8_t GetSearchDrive(void);
@@ -854,11 +867,19 @@ struct DOS_Block {
         uint16_t mediaid_offset = 0x17; // media ID offset in DPB (MS-DOS 4.x-6.x case)
     } tables;
     uint16_t loaded_codepage = 0;
+#if !defined(OSFREE)
     bool set_jdosv_enabled = false;
     bool set_kdosv_enabled = false;
     bool set_pdosv_enabled = false;
     bool set_tdosv_enabled = false;
     bool set_j3100_enabled = false;
+#else
+    static constexpr bool set_jdosv_enabled = false;
+    static constexpr bool set_kdosv_enabled = false;
+    static constexpr bool set_pdosv_enabled = false;
+    static constexpr bool set_tdosv_enabled = false;
+    static constexpr bool set_j3100_enabled = false;
+#endif
     bool im_enable_flag;
     uint16_t dcp;	// Device command packet
 };
@@ -1078,5 +1099,14 @@ const std::map<std::string, int> country_code_map {
 };
 
 void DOS_FlushSTDIN(void);
+
+
+extern unsigned char exepack_handling;
+
+enum {
+	EXEPACK_NONE,
+	EXEPACK_A20OFF,
+	EXEPACK_UNPACK
+};
 
 #endif
