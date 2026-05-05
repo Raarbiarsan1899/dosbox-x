@@ -6351,6 +6351,164 @@ void GFX_Events() {
     emscripten_sleep(0);
 #endif
 
+
+
+    //// write back
+    //std::string pipeNameWrite = std::string("\\\\.\\pipe\\Pipe") + dosbox_title + "Write";
+
+    //LOG_MSG(pipeNameWrite.c_str());
+    //HANDLE hPipeWrite;
+    //hPipeWrite = CreateNamedPipe(
+    //    pipeNameWrite.c_str(),
+    //    //"\\\\.\\pipe\\MyNamedPipeNew", // Pipe name
+    //    PIPE_ACCESS_OUTBOUND,         // Pipe open mode
+    //    //PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, // Pipe mode and blocking mode
+    //    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+    //    1, // Maximum instances
+    //    1024, // Output buffer size
+    //    1024, // Input buffer size
+    //    NMPWAIT_USE_DEFAULT_WAIT, // Default timeout (0 means default)
+    //    NULL // Security attributes
+    //);
+
+    //if(ConnectNamedPipe(hPipeWrite, NULL) != 0) {
+    //    std::vector<uint8_t> response = { 0xDE, 0xAD, 0xBE, 0xEF };
+    //    BOOL success = WriteFile(
+    //        hPipeWrite,                 // Handle to the pipe
+    //        response.data(),       // Message to write
+    //        response.size(),        // Message length
+    //        NULL,         // Bytes written
+    //        NULL);                 // Not overlapped
+    //    DisconnectNamedPipe(hPipeWrite);
+    //}
+    //CloseHandle(hPipeWrite);
+
+
+
+
+    Sint32 inject_x;
+    Sint32 inject_y;
+    int32_t inject_signal;
+    Bitu inject_signal_bits[32]{};
+
+    //std::chrono::milliseconds duration(1);
+    //std::this_thread::sleep_for(duration);
+
+    HANDLE hPipe;
+    char buffer[12]{};
+
+    //char dosbox_title_buffer[20]; // Adjust size as needed
+    //strncpy_s(dosbox_title_buffer, dosbox_title.c_str(), sizeof(dosbox_title_buffer) - 1);
+    //dosbox_title_buffer[sizeof(dosbox_title_buffer) - 1] = '\0'; // Ensure null termination
+    //std::string pipeName = "\\\\.\\pipe\\Pipe" + std::string(dosbox_title_buffer);
+    std::string pipeName = std::string("\\\\.\\pipe\\Pipe") + dosbox_title;
+
+    //LOG_MSG(pipeName.c_str());
+
+    std::this_thread::sleep_for(std::chrono::nanoseconds(1));
+
+    hPipe = CreateNamedPipe(
+        pipeName.c_str(), //"\\\\.\\pipe\\MyNamedPipeNew", // Pipe name
+        PIPE_ACCESS_INBOUND, //PIPE_ACCESS_DUPLEX ,         // Pipe open mode
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, // Pipe mode and blocking mode
+        1, // Maximum instances
+        sizeof(buffer), // Output buffer size
+        sizeof(buffer), // Input buffer size
+        NMPWAIT_USE_DEFAULT_WAIT, // Default timeout (0 means default)
+        NULL // Security attributes
+    );
+
+    if(hPipe == INVALID_HANDLE_VALUE) {
+        //LOG_MSG("Error creating named pipe.");
+    }
+    else {
+        //LOG_MSG("Pipe created successfully.");
+    }
+    BOOL SuccessReadFile;
+    if(ConnectNamedPipe(hPipe, NULL) != 0) {
+        DWORD bytesRead;
+        SuccessReadFile = ReadFile(hPipe, buffer, sizeof(buffer), &bytesRead, NULL);
+        //test_x = (int32_t)buffer[0];
+        //test_y = (int32_t)buffer[0];
+        memcpy(&inject_x, buffer, sizeof(inject_x));
+        memcpy(&inject_y, buffer + sizeof(inject_x), sizeof(inject_y));
+        memcpy(&inject_signal, buffer + sizeof(inject_x) + sizeof(inject_y), sizeof(inject_signal));
+
+        for(int i = 0; i < 32; ++i) {
+            inject_signal_bits[i] = (inject_signal >> i) & 1;
+        }
+
+        // Pass the string to LOG_MSG
+        //char log_msg[100]{};
+
+        //int8_t push_event_status = 2;
+
+        // digits (from right to left)
+        // bit 0: do nothing but push cycle forward(0) do something(1)
+        // bit 1 : movement(0) or click(1)
+        // bit 2 : left(1) or right(0), avaliable only if first digit is 1
+        // bit 3 : pressed(1) or released(0), avaliable only if first digit is 1
+
+        // dosbox_title; // for naming named pipe
+
+
+        if(inject_signal_bits[1] == 0 && inject_signal_bits[0] == 1) {
+            //LOG_MSG("move event");
+
+            SDL_memset(&event, 0, sizeof(event));
+            event.type = SDL_MOUSEMOTION;
+            event.motion.type = SDL_MOUSEMOTION;
+            event.motion.state = 0;
+            event.motion.which = 0;
+            event.motion.x = inject_x;
+            event.motion.y = inject_y;
+            event.motion.xrel = 0l;
+            event.motion.yrel = 0l;
+            //push_event_status = SDL_PushEvent(&event);
+
+            HandleMouseMotion(&event.motion);
+
+        }
+        else if(inject_signal_bits[1] == 1 && inject_signal_bits[0] == 1) {
+            //LOG_MSG("click event");
+
+            SDL_memset(&event, 0, sizeof(event));
+            event.type = SDL_MOUSEBUTTONDOWN;
+            event.motion.type = SDL_MOUSEBUTTONDOWN;
+            event.motion.state = 0;
+            event.motion.which = 0;
+            event.motion.x = inject_x;
+            event.motion.y = inject_y;
+            event.motion.xrel = 0l;
+            event.motion.yrel = 0l;
+            event.button.button = (bool)inject_signal_bits[2] ? SDL_BUTTON_LEFT : SDL_BUTTON_RIGHT;
+            event.button.state = (bool)inject_signal_bits[3] ? SDL_PRESSED : SDL_RELEASED;
+            //push_event_status = SDL_PushEvent(&event);
+
+            HandleMouseButton(&event.button, &event.motion);
+
+        }
+        else if(inject_signal_bits[0] == 0) {
+            //LOG_MSG("do nothing");
+        }
+        else {
+            //LOG_MSG("unknown event");
+        }
+
+
+        //sprintf(log_msg, "Value of buffer is %d", buffer);
+        //sprintf(log_msg, "x %d y %d", &test_x, &test_y);
+
+        //LOG_MSG(buffer);
+        //LOG_MSG(log_msg);
+
+        DisconnectNamedPipe(hPipe);
+
+    }
+
+    CloseHandle(hPipe);
+
+
     while (SDL_PollEvent(&event)) {
         /* DOSBox SVN revision 4176:4177: For Linux/X11, Xorg 1.20.1
          * will make spurious focus gain and loss events when locking the mouse in windowed mode.
