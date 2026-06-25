@@ -6386,127 +6386,148 @@ void GFX_Events() {
 
 
 
-    Sint32 inject_x;
-    Sint32 inject_y;
-    int32_t inject_signal;
-    Bitu inject_signal_bits[32]{};
+    // ---- FREE-RUN mouse injection over named pipe (non-blocking) ----------
+    //
+    // A single pipe instance is created once and kept alive for the whole
+    // process. Connect and read are issued with overlapped (asynchronous) I/O
+    // and polled with a zero-wait GetOverlappedResult, so this never blocks the
+    // emulator's event pump. At most one mouse event is injected per pump, which
+    // preserves the down/up pacing the DOS guest needs to register a click
+    // (the CPU core runs between pumps). No MasterPusher keep-alive is required.
+    //
+    // signal bit layout (from right to left):
+    //   bit 0: do nothing but push cycle forward(0) / do something(1)
+    //   bit 1: movement(0) / click(1)
+    //   bit 2: left(1) / right(0)
+    //   bit 3: pressed(1) / released(0)
 
-    //std::chrono::milliseconds duration(1);
-    //std::this_thread::sleep_for(duration);
+    static HANDLE     pipeHandle  = INVALID_HANDLE_VALUE;
+    static HANDLE     pipeIoEvent = NULL;
+    static OVERLAPPED pipeOv      = {};
+    static int        pipeState   = 0;     // 0 = connecting, 1 = reading
+    static bool       pipeIoPending = false;
+    static char       pipeBuffer[12]{};
 
-    HANDLE hPipe;
-    char buffer[12]{};
+    if (pipeIoEvent == NULL)
+        pipeIoEvent = CreateEvent(NULL, TRUE, FALSE, NULL); // manual reset
 
-    //char dosbox_title_buffer[20]; // Adjust size as needed
-    //strncpy_s(dosbox_title_buffer, dosbox_title.c_str(), sizeof(dosbox_title_buffer) - 1);
-    //dosbox_title_buffer[sizeof(dosbox_title_buffer) - 1] = '\0'; // Ensure null termination
-    //std::string pipeName = "\\\\.\\pipe\\Pipe" + std::string(dosbox_title_buffer);
-    std::string pipeName = std::string("\\\\.\\pipe\\Pipe") + dosbox_title;
-
-    //LOG_MSG(pipeName.c_str());
-
-    std::this_thread::sleep_for(std::chrono::nanoseconds(1));
-
-    hPipe = CreateNamedPipe(
-        pipeName.c_str(), //"\\\\.\\pipe\\MyNamedPipeNew", // Pipe name
-        PIPE_ACCESS_INBOUND, //PIPE_ACCESS_DUPLEX ,         // Pipe open mode
-        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, // Pipe mode and blocking mode
-        1, // Maximum instances
-        sizeof(buffer), // Output buffer size
-        sizeof(buffer), // Input buffer size
-        NMPWAIT_USE_DEFAULT_WAIT, // Default timeout (0 means default)
-        NULL // Security attributes
-    );
-
-    if(hPipe == INVALID_HANDLE_VALUE) {
-        //LOG_MSG("Error creating named pipe.");
-    }
-    else {
-        //LOG_MSG("Pipe created successfully.");
-    }
-    BOOL SuccessReadFile;
-    if(ConnectNamedPipe(hPipe, NULL) != 0) {
-        DWORD bytesRead;
-        SuccessReadFile = ReadFile(hPipe, buffer, sizeof(buffer), &bytesRead, NULL);
-        //test_x = (int32_t)buffer[0];
-        //test_y = (int32_t)buffer[0];
-        memcpy(&inject_x, buffer, sizeof(inject_x));
-        memcpy(&inject_y, buffer + sizeof(inject_x), sizeof(inject_y));
-        memcpy(&inject_signal, buffer + sizeof(inject_x) + sizeof(inject_y), sizeof(inject_signal));
-
-        for(int i = 0; i < 32; ++i) {
-            inject_signal_bits[i] = (inject_signal >> i) & 1;
-        }
-
-        // Pass the string to LOG_MSG
-        //char log_msg[100]{};
-
-        //int8_t push_event_status = 2;
-
-        // digits (from right to left)
-        // bit 0: do nothing but push cycle forward(0) do something(1)
-        // bit 1 : movement(0) or click(1)
-        // bit 2 : left(1) or right(0), avaliable only if first digit is 1
-        // bit 3 : pressed(1) or released(0), avaliable only if first digit is 1
-
-        // dosbox_title; // for naming named pipe
-
-
-        if(inject_signal_bits[1] == 0 && inject_signal_bits[0] == 1) {
-            //LOG_MSG("move event");
-
-            SDL_memset(&event, 0, sizeof(event));
-            event.type = SDL_MOUSEMOTION;
-            event.motion.type = SDL_MOUSEMOTION;
-            event.motion.state = 0;
-            event.motion.which = 0;
-            event.motion.x = inject_x;
-            event.motion.y = inject_y;
-            event.motion.xrel = 0l;
-            event.motion.yrel = 0l;
-            //push_event_status = SDL_PushEvent(&event);
-
-            HandleMouseMotion(&event.motion);
-
-        }
-        else if(inject_signal_bits[1] == 1 && inject_signal_bits[0] == 1) {
-            //LOG_MSG("click event");
-
-            SDL_memset(&event, 0, sizeof(event));
-            event.type = SDL_MOUSEBUTTONDOWN;
-            event.motion.type = SDL_MOUSEBUTTONDOWN;
-            event.motion.state = 0;
-            event.motion.which = 0;
-            event.motion.x = inject_x;
-            event.motion.y = inject_y;
-            event.motion.xrel = 0l;
-            event.motion.yrel = 0l;
-            event.button.button = (bool)inject_signal_bits[2] ? SDL_BUTTON_LEFT : SDL_BUTTON_RIGHT;
-            event.button.state = (bool)inject_signal_bits[3] ? SDL_PRESSED : SDL_RELEASED;
-            //push_event_status = SDL_PushEvent(&event);
-
-            HandleMouseButton(&event.button, &event.motion);
-
-        }
-        else if(inject_signal_bits[0] == 0) {
-            //LOG_MSG("do nothing");
-        }
-        else {
-            //LOG_MSG("unknown event");
-        }
-
-
-        //sprintf(log_msg, "Value of buffer is %d", buffer);
-        //sprintf(log_msg, "x %d y %d", &test_x, &test_y);
-
-        //LOG_MSG(buffer);
-        //LOG_MSG(log_msg);
-
-        DisconnectNamedPipe(hPipe);
-
+    // Create the single pipe instance once (overlapped).
+    if (pipeHandle == INVALID_HANDLE_VALUE) {
+        std::string pipeName = std::string("\\\\.\\pipe\\Pipe") + dosbox_title;
+        pipeHandle = CreateNamedPipe(
+            pipeName.c_str(),
+            PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1,                  // max instances
+            sizeof(pipeBuffer), // out buffer
+            sizeof(pipeBuffer), // in buffer
+            0,                  // default timeout
+            NULL);
+        pipeState     = 0;
+        pipeIoPending = false;
     }
 
-    CloseHandle(hPipe);
+    if (pipeHandle != INVALID_HANDLE_VALUE) {
+
+        // --- phase: wait for a client to connect ---------------------------
+        if (pipeState == 0) {
+            if (!pipeIoPending) {
+                ZeroMemory(&pipeOv, sizeof(pipeOv));
+                pipeOv.hEvent = pipeIoEvent;
+                ResetEvent(pipeIoEvent);
+                BOOL  c = ConnectNamedPipe(pipeHandle, &pipeOv);
+                DWORD e = GetLastError();
+                if (c || e == ERROR_PIPE_CONNECTED) {
+                    pipeState = 1;                 // already connected
+                } else if (e == ERROR_IO_PENDING) {
+                    pipeIoPending = true;          // wait, no block
+                } else {
+                    CloseHandle(pipeHandle);       // give up, recreate next pump
+                    pipeHandle = INVALID_HANDLE_VALUE;
+                }
+            } else {
+                DWORD n = 0;
+                if (GetOverlappedResult(pipeHandle, &pipeOv, &n, FALSE)) {
+                    pipeIoPending = false;
+                    pipeState = 1;
+                } else if (GetLastError() != ERROR_IO_INCOMPLETE) {
+                    CloseHandle(pipeHandle);
+                    pipeHandle = INVALID_HANDLE_VALUE;
+                }
+                // ERROR_IO_INCOMPLETE => still connecting, try next pump
+            }
+        }
+
+        // --- phase: read one 12-byte command -------------------------------
+        if (pipeHandle != INVALID_HANDLE_VALUE && pipeState == 1) {
+            if (!pipeIoPending) {
+                ZeroMemory(&pipeOv, sizeof(pipeOv));
+                pipeOv.hEvent = pipeIoEvent;
+                ResetEvent(pipeIoEvent);
+                DWORD n = 0;
+                BOOL  r = ReadFile(pipeHandle, pipeBuffer, sizeof(pipeBuffer), &n, &pipeOv);
+                if (r || GetLastError() == ERROR_IO_PENDING) {
+                    pipeIoPending = true;
+                } else {
+                    DisconnectNamedPipe(pipeHandle); // client gone; re-arm connect
+                    pipeState = 0;
+                }
+            }
+            if (pipeHandle != INVALID_HANDLE_VALUE && pipeIoPending && pipeState == 1) {
+                DWORD n = 0;
+                if (GetOverlappedResult(pipeHandle, &pipeOv, &n, FALSE)) {
+                    pipeIoPending = false;
+                    if (n == sizeof(pipeBuffer)) {
+                        Sint32 inject_x, inject_y;
+                        int32_t inject_signal;
+                        memcpy(&inject_x, pipeBuffer, sizeof(inject_x));
+                        memcpy(&inject_y, pipeBuffer + sizeof(inject_x), sizeof(inject_y));
+                        memcpy(&inject_signal, pipeBuffer + sizeof(inject_x) + sizeof(inject_y), sizeof(inject_signal));
+
+                        Bitu inject_signal_bits[32]{};
+                        for (int i = 0; i < 32; ++i)
+                            inject_signal_bits[i] = (inject_signal >> i) & 1;
+
+                        if (inject_signal_bits[1] == 0 && inject_signal_bits[0] == 1) {
+                            SDL_memset(&event, 0, sizeof(event));
+                            event.type = SDL_MOUSEMOTION;
+                            event.motion.type = SDL_MOUSEMOTION;
+                            event.motion.state = 0;
+                            event.motion.which = 0;
+                            event.motion.x = inject_x;
+                            event.motion.y = inject_y;
+                            event.motion.xrel = 0l;
+                            event.motion.yrel = 0l;
+                            HandleMouseMotion(&event.motion);
+                        }
+                        else if (inject_signal_bits[1] == 1 && inject_signal_bits[0] == 1) {
+                            SDL_memset(&event, 0, sizeof(event));
+                            event.type = SDL_MOUSEBUTTONDOWN;
+                            event.motion.type = SDL_MOUSEBUTTONDOWN;
+                            event.motion.state = 0;
+                            event.motion.which = 0;
+                            event.motion.x = inject_x;
+                            event.motion.y = inject_y;
+                            event.motion.xrel = 0l;
+                            event.motion.yrel = 0l;
+                            event.button.button = (bool)inject_signal_bits[2] ? SDL_BUTTON_LEFT : SDL_BUTTON_RIGHT;
+                            event.button.state = (bool)inject_signal_bits[3] ? SDL_PRESSED : SDL_RELEASED;
+                            HandleMouseButton(&event.button, &event.motion);
+                        }
+                        // inject_signal_bits[0] == 0 => do nothing (cycle forward)
+                    }
+                    // one client = one message: drop it and re-arm connect
+                    DisconnectNamedPipe(pipeHandle);
+                    pipeState = 0;
+                } else if (GetLastError() != ERROR_IO_INCOMPLETE) {
+                    DisconnectNamedPipe(pipeHandle);
+                    pipeIoPending = false;
+                    pipeState = 0;
+                }
+                // ERROR_IO_INCOMPLETE => still reading, try next pump
+            }
+        }
+    }
 
 
     while (SDL_PollEvent(&event)) {
